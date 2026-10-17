@@ -54,12 +54,12 @@ python -m unittest -v test_policy_engine.py
 export HF_TOKEN=hf_YOUR_TOKEN_HERE   # get at huggingface.co → Settings → Access Tokens
 ```
 
-Then start the server (MLX for Apple Silicon, or omit `--device` for auto-detect):
+Then start the server (MPS for Apple Silicon Metal, or omit `--device` for auto-detect):
 
 ```bash
 strands-decider serve \
   StrandsAgents/strands-decider-2B-qwen3.5-v1-2610 \
-  --device mlx \
+  --device mps \
   --port 8099
 ```
 
@@ -74,7 +74,7 @@ python run_eval_harness.py \
   --output results/intentlock_eval_results.json
 ```
 
-The harness checks `/health` and requires an MLX backend report before proceeding. Results are written as JSON with per-scenario decisions, confidence scores, latency statistics, and implementation integrity probes.
+The harness checks `/health` and requires an MLX backend report before proceeding by default. Pass `--allow-non-mlx` when running on MPS. Results are written as JSON with per-scenario decisions, confidence scores, latency statistics, and implementation integrity probes.
 
 ---
 
