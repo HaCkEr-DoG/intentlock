@@ -170,10 +170,10 @@ The questions schema (`INTENTLOCK_QUESTIONS`) is also exported directly and can 
 
 ## Try it yourself
 
-Repository: **[YOUR GITHUB LINK HERE]**
+Repository: **[github.com/HaCkEr-DoG/intentlock](https://github.com/HaCkEr-DoG/intentlock)**
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/intentlock
+git clone https://github.com/HaCkEr-DoG/intentlock
 cd intentlock
 uv venv --python 3.12 .venv && source .venv/bin/activate
 pip install -r requirements.txt
