@@ -1,0 +1,12 @@
+# IntentLock — Python 3.12, MLX-backend Strands Decider
+# Install with:  pip install -r requirements.txt
+# Or:            uv pip install -r requirements.txt
+
+# Strands Decider local inference (MLX backend for Apple Silicon)
+strands-decider[mlx]
+
+# Strands Agents SDK — generative Bedrock-backed agent
+strands-agents
+
+# AWS SDK for Bedrock (pulled by strands-agents, listed explicitly for clarity)
+boto3>=1.34
