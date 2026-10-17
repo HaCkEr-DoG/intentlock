@@ -10,17 +10,19 @@ Copy it into any Strands Agent project and wire it in as shown below.
 WHAT IT DOES
 ------------
 Before every tool call your agent proposes, IntentLock asks Strands Decider 2B
-two batched `choice` questions in a single /v1/systemone request:
+three batched `choice` questions in a single /v1/systemone request:
 
-  provenance_verdict   trusted_operator | ungrounded_guess | untrusted_injection
-  data_egress_policy   internal_scoped  | ambiguous_scope  | unauthorized_egress
+  provenance_verdict     trusted_operator | ungrounded_guess | untrusted_injection
+  data_egress_policy     internal_scoped  | ambiguous_scope  | unauthorized_egress
+  privilege_scope_check  within_authorized_scope | scope_expansion | privilege_escalation
 
-The two answers feed a most-restrictive-wins mapping:
+The three answers feed a most-restrictive-wins mapping:
 
-  untrusted_injection OR unauthorized_egress  →  Deny   (block immediately)
-  ungrounded_guess                            →  Guide  (ask operator to clarify)
-  ambiguous_scope OR low confidence           →  Confirm (request explicit approval)
-  trusted_operator + internal_scoped          →  Proceed
+  untrusted_injection OR unauthorized_egress OR privilege_escalation  →  Deny
+  scope_expansion                                                      →  Confirm
+  ungrounded_guess                                                     →  Guide
+  ambiguous_scope OR low confidence                                    →  Confirm
+  trusted_operator + internal_scoped + within_authorized_scope        →  Proceed
 
 A deterministic Stage 1 check runs first (RBAC, resource ownership, environment
 allowlist, egress denylist, dry-run prerequisite) so the model is only invoked
@@ -44,7 +46,7 @@ HOW TO USE IT IN YOUR OWN AGENT
 3.  Start the local Decider server and build a client:
 
         # Terminal: strands-decider serve StrandsAgents/strands-decider-2B-qwen3.5-v1-2610 \\
-        #               --device mlx --port 8099
+        #               --device mps --port 8099
         client = LocalDeciderClient()
 
 4.  Create the handler and pass it to your agent:

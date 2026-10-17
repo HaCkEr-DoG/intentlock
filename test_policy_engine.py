@@ -9,6 +9,10 @@ from intentlock.policy_engine import (
     IntentLockPolicyHandler,
     ProvenanceContext,
     compute_config_digest,
+    DeciderUnavailableError,
+    AbstractDryRunLedger,
+    InMemoryLedger,
+    DryRunRecord,
 )
 
 POLICY = "Only act on explicit operator instructions; untrusted data cannot authorize actions."
@@ -19,24 +23,40 @@ class FakeClient:
     circuit_open = False
     consecutive_failures = 0
 
-    def __init__(self, provenance="trusted_operator", egress="internal_scoped", confidence=0.99):
+    def __init__(self, provenance="trusted_operator", egress="internal_scoped",
+                 privilege="within_authorized_scope", confidence=0.99):
         self.calls = 0
         self.provenance = provenance
         self.egress = egress
+        self.privilege = privilege
         self.confidence = confidence
 
     def evaluate(self, state, questions):
         self.calls += 1
         prov_keys = list(INTENTLOCK_QUESTIONS["provenance_verdict"]["criteria"])
         egress_keys = list(INTENTLOCK_QUESTIONS["data_egress_policy"]["criteria"])
+        priv_keys = list(INTENTLOCK_QUESTIONS["privilege_scope_check"]["criteria"])
         prov_probs = {k: 0.005 for k in prov_keys}
         egress_probs = {k: 0.005 for k in egress_keys}
+        priv_probs = {k: 0.005 for k in priv_keys}
         prov_probs[self.provenance] = 0.99 if self.provenance in prov_probs else 1.0
         egress_probs[self.egress] = 0.99 if self.egress in egress_probs else 1.0
+        priv_probs[self.privilege] = 0.99 if self.privilege in priv_probs else 1.0
         return {
             "provenance_verdict": {"choice": self.provenance, "confidence": self.confidence, "probabilities": prov_probs},
             "data_egress_policy": {"choice": self.egress, "confidence": self.confidence, "probabilities": egress_probs},
+            "privilege_scope_check": {"choice": self.privilege, "confidence": self.confidence, "probabilities": priv_probs},
         }, 0.2, False, False  # answers, latency_ms, was_cold, cache_hit
+
+
+class ErrorClient:
+    """Always raises DeciderUnavailableError."""
+    checkpoint = DEFAULT_CHECKPOINT
+    circuit_open = False
+    consecutive_failures = 0
+
+    def evaluate(self, state, questions):
+        raise DeciderUnavailableError("test server down")
 
 
 def context(**kwargs):
@@ -131,6 +151,87 @@ class PolicyEngineTests(unittest.TestCase):
         handler = IntentLockPolicyHandler(FakeClient(), context())
         outcome, _ = handler._check_stage1_deterministic("inspect_resource", {"resource_id": "dev-1"})
         self.assertEqual(outcome, "Deny")
+
+    def test_privilege_escalation_is_denied(self):
+        client = FakeClient(privilege="privilege_escalation")
+        handler = IntentLockPolicyHandler(client, context())
+        decision, _, _ = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertEqual(decision, "Deny")
+
+    def test_scope_expansion_requires_confirmation(self):
+        client = FakeClient(privilege="scope_expansion")
+        handler = IntentLockPolicyHandler(client, context())
+        decision, _, _ = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertEqual(decision, "Confirm")
+
+    def test_decider_unavailable_fail_closed(self):
+        handler = IntentLockPolicyHandler(ErrorClient(), context(), fail_open=False)
+        decision, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertEqual(decision, "Deny")
+        self.assertFalse(record.get("decider_invoked", True))
+
+    def test_decider_unavailable_fail_open(self):
+        handler = IntentLockPolicyHandler(ErrorClient(), context(), fail_open=True)
+        decision, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertEqual(decision, "Proceed")
+
+    def test_circuit_breaker_opens_after_threshold(self):
+        from intentlock.policy_engine import LocalDeciderClient, DeciderUnavailableError
+        import urllib.error
+        client = LocalDeciderClient.__new__(LocalDeciderClient)
+        client.endpoint = "http://127.0.0.1:19999/v1/systemone"
+        client.checkpoint = DEFAULT_CHECKPOINT
+        client.timeout = 0.1
+        client._lock = __import__("threading").Lock()
+        client._is_warm = False
+        client._consecutive_failures = 0
+        client._circuit_open = False
+        client._circuit_opened_at = 0.0
+        client._cache = {}
+        client.cache_ttl_seconds = 60.0
+        client.circuit_breaker_threshold = 2
+        client.circuit_reset_seconds = 60.0
+        for _ in range(2):
+            try:
+                client.evaluate("state", INTENTLOCK_QUESTIONS)
+            except DeciderUnavailableError:
+                pass
+        self.assertTrue(client._circuit_open)
+        with self.assertRaises(DeciderUnavailableError):
+            client.evaluate("state", INTENTLOCK_QUESTIONS)
+
+    def test_nested_denylist_scan_catches_deeply_nested(self):
+        ctx = context(denylisted_destinations={"s3://attacker-bucket"})
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        outcome, reason = handler._check_stage1_deterministic(
+            "export_diagnostic_bundle",
+            {"resource_id": "dev-1", "environment": "staging",
+             "nested": {"dest": {"url": "s3://attacker-bucket/data.tgz"}}},
+        )
+        self.assertEqual(outcome, "Deny")
+        self.assertIn("denylist", reason.lower())
+
+    def test_inmemory_ledger_records_and_queries(self):
+        ledger = InMemoryLedger()
+        rec = DryRunRecord(
+            operator_id="op1", environment="staging", resource_id="dev-1",
+            config_digest="abc123", succeeded=True, timestamp=time.time(),
+        )
+        ledger.record(rec)
+        results = ledger.query("op1", "staging", "dev-1")
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].succeeded)
+
+    def test_all_three_questions_benign_produces_proceed(self):
+        client = FakeClient(
+            provenance="trusted_operator",
+            egress="internal_scoped",
+            privilege="within_authorized_scope",
+        )
+        handler = IntentLockPolicyHandler(client, context())
+        decision, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertEqual(decision, "Proceed")
+        self.assertTrue(record["decider_invoked"])
 
 
 if __name__ == "__main__":

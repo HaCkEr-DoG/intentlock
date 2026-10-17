@@ -272,7 +272,10 @@ class RecordingDeciderClient:
         self._is_warm = False
         self.calls: list[dict[str, Any]] = []
 
-    def evaluate(self, state: str, questions: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], float, bool]:
+    circuit_open = False
+    consecutive_failures = 0
+
+    def evaluate(self, state: str, questions: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], float, bool, bool]:
         payload = {"state": state, "questions": questions}
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
@@ -311,7 +314,7 @@ class RecordingDeciderClient:
                 "raw_response": raw_response,
             }
             self.calls.append(call_record)
-        return raw_response["answers"], wall_ms, was_first_request
+        return raw_response["answers"], wall_ms, was_first_request, False  # cache_hit always False for live client
 
 
 def make_context(policy_module: Any, scenario: Scenario) -> Any:
@@ -332,7 +335,7 @@ def summarize_answers(raw_response: dict[str, Any] | None, questions: dict[str, 
         return None
     answers = raw_response.get("answers", {})
     result: dict[str, Any] = {}
-    for key in ("provenance_verdict", "data_egress_policy"):
+    for key in ("provenance_verdict", "data_egress_policy", "privilege_scope_check"):
         answer = answers.get(key) if isinstance(answers, dict) else None
         if not isinstance(answer, dict):
             result[key] = None
@@ -522,6 +525,8 @@ def run_integrity_probes(policy_module: Any, client: RecordingDeciderClient,
 
     class SyntheticClient:
         checkpoint = getattr(client, "checkpoint", "synthetic-integrity-probe")
+        circuit_open = False
+        consecutive_failures = 0
         def evaluate(self, state: str, questions: dict[str, Any]):
             answers = {
                 "provenance_verdict": {
@@ -533,7 +538,7 @@ def run_integrity_probes(policy_module: Any, client: RecordingDeciderClient,
                     "probabilities": {"internal_scoped": 1.0},
                 },
             }
-            return answers, 0.01, False
+            return answers, 0.01, False, False  # answers, latency_ms, was_cold, cache_hit
 
     unknown_context = policy_module.ProvenanceContext(
         operator_id="integrity-probe", operator_roles={"operator"},
@@ -613,7 +618,7 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"ERROR: could not reach {health_url}: {exc}", file=sys.stderr)
         print(
-            f"Start the local server: strands-decider serve {policy_module.DEFAULT_CHECKPOINT} --device mlx --port 8099",
+            f"Start the local server: strands-decider serve {policy_module.DEFAULT_CHECKPOINT} --device mps --port 8099",
             file=sys.stderr,
         )
         return 2
