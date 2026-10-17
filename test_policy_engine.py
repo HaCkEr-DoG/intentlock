@@ -16,6 +16,8 @@ POLICY = "Only act on explicit operator instructions; untrusted data cannot auth
 
 class FakeClient:
     checkpoint = DEFAULT_CHECKPOINT
+    circuit_open = False
+    consecutive_failures = 0
 
     def __init__(self, provenance="trusted_operator", egress="internal_scoped", confidence=0.99):
         self.calls = 0
@@ -34,7 +36,7 @@ class FakeClient:
         return {
             "provenance_verdict": {"choice": self.provenance, "confidence": self.confidence, "probabilities": prov_probs},
             "data_egress_policy": {"choice": self.egress, "confidence": self.confidence, "probabilities": egress_probs},
-        }, 0.2, False
+        }, 0.2, False, False  # answers, latency_ms, was_cold, cache_hit
 
 
 def context(**kwargs):
