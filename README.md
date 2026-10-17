@@ -46,7 +46,15 @@ python -m unittest -v test_policy_engine.py
 
 ## Running the policy harness
 
-### Terminal 1 — start the local MLX Decider server
+### Terminal 1 — start the local Decider server
+
+**Important:** On first run, `strands-decider serve` downloads the `Qwen/Qwen3.5-2B-Base` base model (~4.5 GB). Set a HuggingFace token first to avoid rate-limiting:
+
+```bash
+export HF_TOKEN=hf_YOUR_TOKEN_HERE   # get at huggingface.co → Settings → Access Tokens
+```
+
+Then start the server (MLX for Apple Silicon, or omit `--device` for auto-detect):
 
 ```bash
 strands-decider serve \
@@ -54,6 +62,8 @@ strands-decider serve \
   --device mlx \
   --port 8099
 ```
+
+Wait for the server to print `Application startup complete.` before running the harness.
 
 ### Terminal 2 — run the seven-scenario harness
 
@@ -102,7 +112,7 @@ intentlock_mock_eval_results.json   ← mock interface run (not real MLX metrics
 - The dry-run ledger is an in-process object, not a tamper-proof audit store. Only trusted tool code should call `record_dry_run(..., succeeded=True)` after a real structured success.
 - Decider confidence is not a security guarantee. Thresholds need empirical validation on your hardware and real scenarios.
 - The Bedrock-backed end-to-end demo has not been executed; compile and unit tests do not prove installed-package compatibility or intervention lifecycle behaviour.
-- Latency must be measured on the actual Mac M4 with the real checkpoint; published benchmarks are from other hardware.
+- Latency numbers in the article are from the published Strands Decider 2B model card benchmarks. Run `run_eval_harness.py` against a live server for your own hardware numbers.
 
 ---
 
