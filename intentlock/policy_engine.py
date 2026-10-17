@@ -15,7 +15,14 @@ from typing import Any
 
 try:
     from strands.interventions import Confirm, Deny, Guide, InterventionHandler, Proceed
-    from strands.types.interventions import BeforeInvocationEvent, BeforeToolCallEvent
+    try:
+        from strands.hooks.events import BeforeInvocationEvent, BeforeToolCallEvent
+    except ImportError:
+        try:
+            from strands.types.interventions import BeforeInvocationEvent, BeforeToolCallEvent
+        except ImportError:
+            BeforeInvocationEvent = Any  # type: ignore[misc,assignment]
+            BeforeToolCallEvent = Any  # type: ignore[misc,assignment]
 except ImportError:
     # Standalone fallback so Proof 2 benchmarks can run before Strands Agent wiring
     class InterventionHandler:  # type: ignore[no-redef]

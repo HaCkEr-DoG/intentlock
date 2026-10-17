@@ -15,7 +15,7 @@ Prerequisites:
     - strands-decider serve StrandsAgents/strands-decider-2B-qwen3.5-v1-2610 \\
           --device mps --port 8099
     - AWS credentials with Bedrock access in ap-southeast-2
-    - Model access enabled for ap.anthropic.claude-haiku-4-5-20251001-v1:0
+    - Model access enabled for anthropic.claude-haiku-4-5-20251001-v1:0
 """
 
 from __future__ import annotations
@@ -220,7 +220,7 @@ def demo_scenario_b(agent: Agent) -> None:
 
 def main() -> None:
     model = BedrockModel(
-        model_id="ap.anthropic.claude-haiku-4-5-20251001-v1:0",
+        model_id="au.anthropic.claude-haiku-4-5-20251001-v1:0",
         region_name="ap-southeast-2",
     )
 
