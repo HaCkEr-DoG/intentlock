@@ -13,7 +13,7 @@ Run:
 
 Prerequisites:
     - strands-decider serve StrandsAgents/strands-decider-2B-qwen3.5-v1-2610 \\
-          --device mlx --port 8099
+          --device mps --port 8099
     - AWS credentials with Bedrock access in us-east-1
     - Model access enabled for us.anthropic.claude-haiku-4-5-20251001-v1:0
 """

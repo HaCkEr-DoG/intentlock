@@ -25,7 +25,7 @@ IntentLock is a provenance-aware temporal policy engine for agentic InfraOps. It
 1. **Provenance verdict** — Did the proposed tool call's arguments come from what the operator actually said, or were they guessed or injected from untrusted data?
 2. **Data egress policy** — Does this operation stay within the authorized scope, or is it trying to send data somewhere it shouldn't?
 
-Both questions are answered by Strands Decider 2B in a single batched `/v1/systemone` request. On Apple M4, this takes around 150 ms — fast enough to sit in every tool call's path.
+Both questions are answered by Strands Decider 2B in a single batched `/v1/systemone` request. On my M4 MacBook Air using PyTorch MPS, warm calls take around 1,900 ms median. The Strands Decider 2B model card quotes ~115–153 ms for the MLX-native runtime — see the test results section for the full measured breakdown.
 
 The result is one of four typed actions: **Proceed**, **Guide** (ask the operator for clarification), **Deny** (block the call immediately), or **Confirm** (pause and ask explicitly before proceeding).
 
