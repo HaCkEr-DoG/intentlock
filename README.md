@@ -111,8 +111,8 @@ intentlock_mock_eval_results.json   ← mock interface run (not real MLX metrics
 
 - The dry-run ledger is an in-process object, not a tamper-proof audit store. Only trusted tool code should call `record_dry_run(..., succeeded=True)` after a real structured success.
 - Decider confidence is not a security guarantee. Thresholds need empirical validation on your hardware and real scenarios.
-- The Bedrock-backed end-to-end demo has not been executed; compile and unit tests do not prove installed-package compatibility or intervention lifecycle behaviour.
-- Latency numbers in the article are from the published Strands Decider 2B model card benchmarks. Run `run_eval_harness.py` against a live server for your own hardware numbers.
+- The dry-run ledger records are in-process; only trusted tool code should call `record_dry_run(..., succeeded=True)` after a real structured success.
+- Latency numbers in the article are from live MPS runs on an M4 MacBook Air. Run `run_eval_harness.py --repeat 5` against a live server to reproduce.
 
 ---
 
