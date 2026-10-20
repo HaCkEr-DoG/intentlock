@@ -164,6 +164,23 @@ class PolicyEngineTests(unittest.TestCase):
         decision, _, _ = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
         self.assertEqual(decision, "Confirm")
 
+    def test_low_confidence_privilege_requires_confirmation(self):
+        client = FakeClient(privilege="within_authorized_scope", confidence=0.50)
+        handler = IntentLockPolicyHandler(client, context(), confidence_threshold=0.70)
+        decision, _, _ = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertEqual(decision, "Confirm")
+
+    def test_denylist_catches_key_as_well_as_value(self):
+        ctx = context(denylisted_destinations={"attacker@example.com"})
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        outcome, reason = handler._check_stage1_deterministic(
+            "inspect_resource",
+            {"resource_id": "dev-1", "environment": "staging",
+             "attacker@example.com": "anything"},
+        )
+        self.assertEqual(outcome, "Deny")
+        self.assertIn("denylist", reason.lower())
+
     def test_decider_unavailable_fail_closed(self):
         handler = IntentLockPolicyHandler(ErrorClient(), context(), fail_open=False)
         decision, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})

@@ -264,6 +264,11 @@ class ProvenanceContext:
     # Ledger — override with a DynamoDB-backed implementation for multi-invocation workflows
     _ledger: AbstractDryRunLedger = field(default_factory=InMemoryLedger, repr=False)
 
+    def __post_init__(self) -> None:
+        # Non-field threading lock so concurrent tool calls can't race on the ledger.
+        # Not a dataclass field: won't appear in asdict(), fields(), or comparisons.
+        self._lock_obj: threading.Lock = threading.Lock()
+
     # Compat: expose as list for code that reads dry_run_ledger directly
     @property
     def dry_run_ledger(self) -> list[DryRunRecord]:
@@ -290,16 +295,17 @@ class ProvenanceContext:
             raise ValueError("Dry-run timestamp must be a finite Unix timestamp.")
         if not isinstance(succeeded, bool):
             raise TypeError("succeeded must be a bool from the trusted tool execution path.")
-        self._ledger.record(
-            DryRunRecord(
-                operator_id=self.operator_id,
-                environment=environment,
-                resource_id=resource_id,
-                config_digest=digest,
-                succeeded=bool(succeeded),
-                timestamp=float(recorded_at),
+        with self._lock_obj:
+            self._ledger.record(
+                DryRunRecord(
+                    operator_id=self.operator_id,
+                    environment=environment,
+                    resource_id=resource_id,
+                    config_digest=digest,
+                    succeeded=bool(succeeded),
+                    timestamp=float(recorded_at),
+                )
             )
-        )
         return digest
 
     def verify_dry_run_prerequisite(
@@ -316,11 +322,10 @@ class ProvenanceContext:
             return False, "Invalid dry-run TTL configuration; refusing to verify a prerequisite."
         expected_digest = compute_config_digest(config_payload)
 
-        matching_resource = [
-            r
-            for r in self._ledger.query(self.operator_id, environment, resource_id)
-            if r.succeeded
-        ]
+        with self._lock_obj:
+            records_snapshot = list(self._ledger.query(self.operator_id, environment, resource_id))
+
+        matching_resource = [r for r in records_snapshot if r.succeeded]
         if not matching_resource:
             return (
                 False,
@@ -468,6 +473,9 @@ class LocalDeciderClient:
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 self._is_warm = True
                 self._consecutive_failures = 0
+                # Evict oldest entry before inserting so the cache stays bounded.
+                if len(self._cache) >= 256:
+                    self._cache.pop(next(iter(self._cache)))
                 self._cache[cache_key] = (body["answers"], now)
                 return body["answers"], latency_ms, was_cold, False
             except Exception as exc:
@@ -542,6 +550,14 @@ class IntentLockPolicyHandler(InterventionHandler):
         else:
             untrusted_section = "None"
 
+        directive = self.context.trusted_operator_directive
+        if len(directive) > 2000:
+            directive = directive[:2000] + "\n[… directive truncated for policy evaluation …]"
+
+        args_json = json.dumps(tool_args, sort_keys=True, ensure_ascii=False)
+        if len(args_json) > 4000:
+            args_json = args_json[:4000] + "… [truncated]"
+
         return (
             f"[WRITTEN POLICY]\n{self.context.written_policy}\n\n"
             f"[TRUSTED OPERATOR DIRECTIVE]\n"
@@ -549,11 +565,11 @@ class IntentLockPolicyHandler(InterventionHandler):
             f"Operator Roles: {sorted(self.context.operator_roles)}\n"
             f"Authorized Environments: {sorted(self.context.allowed_environments)}\n"
             f"Authorized Resources: {sorted(self.context.owned_resources)}\n"
-            f"Directive: {self.context.trusted_operator_directive}\n\n"
+            f"Directive: {directive}\n\n"
             f"[UNTRUSTED EXTERNAL DATA]\n{untrusted_section}\n\n"
             f"[PROPOSED TOOL CALL]\n"
             f"Tool: {tool_name}\n"
-            f"Arguments: {json.dumps(tool_args, sort_keys=True, ensure_ascii=False)}"
+            f"Arguments: {args_json}"
         )
 
     def _scan_for_denylist(self, value: Any, depth: int = 0) -> str | None:
@@ -583,9 +599,9 @@ class IntentLockPolicyHandler(InterventionHandler):
         if not isinstance(tool_args, dict):
             return "Deny", "Malformed tool arguments: expected a dictionary."
 
-        # Recursive denylist scan — catches nested destinations
-        for val in tool_args.values():
-            found = self._scan_for_denylist(val)
+        # Recursive denylist scan — checks both keys and values, catches nested destinations
+        for key, val in tool_args.items():
+            found = self._scan_for_denylist(key) or self._scan_for_denylist(val)
             if found is not None:
                 return (
                     "Deny",
@@ -688,6 +704,7 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "cache_hit": False,
                 "was_cold_start": False,
                 "circuit_open": self.client.circuit_open,
+                "consecutive_failures": self.client.consecutive_failures,
                 "state_chars": 0,
                 "state_tokens_est": 0,
                 "provenance_choice": None,
@@ -726,6 +743,7 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "cache_hit": False,
                 "was_cold_start": False,
                 "circuit_open": self.client.circuit_open,
+                "consecutive_failures": self.client.consecutive_failures,
                 "state_chars": len(envelope),
                 "state_tokens_est": max(1, len(envelope) // 4),
                 "provenance_choice": None,
@@ -769,6 +787,15 @@ class IntentLockPolicyHandler(InterventionHandler):
 
                 valid_prov = set(INTENTLOCK_QUESTIONS["provenance_verdict"]["criteria"])
                 valid_egress = set(INTENTLOCK_QUESTIONS["data_egress_policy"]["criteria"])
+                valid_priv = set(INTENTLOCK_QUESTIONS["privilege_scope_check"]["criteria"])
+
+                # Validate privilege probability map; if malformed, treat as unanswered
+                # (the question is optional — a bad response is safer than a Deny cascade).
+                if isinstance(priv, dict) and priv_choice is not None:
+                    priv_probs = priv.get("probabilities")
+                    if priv_probs is not None and not valid_probability_map(priv_probs, valid_priv):
+                        priv_choice = None
+                        priv_conf = 0.0
 
                 if prov_choice not in valid_prov or egress_choice not in valid_egress:
                     reason = (
@@ -815,6 +842,7 @@ class IntentLockPolicyHandler(InterventionHandler):
                             or priv_choice == "scope_expansion"
                             or prov_conf < self.confidence_threshold
                             or egress_conf < self.confidence_threshold
+                            or (priv_choice is not None and priv_conf < self.confidence_threshold)
                         ):
                             reason = (
                                 f"Operator confirmation required for '{tool_name}' "
@@ -855,6 +883,7 @@ class IntentLockPolicyHandler(InterventionHandler):
             "cache_hit": cache_hit,
             "was_cold_start": was_cold,
             "circuit_open": self.client.circuit_open,
+            "consecutive_failures": self.client.consecutive_failures,
             "state_chars": len(envelope),
             "state_tokens_est": max(1, len(envelope) // 4),
             "provenance_choice": prov_choice,

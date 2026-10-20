@@ -335,7 +335,7 @@ def summarize_answers(raw_response: dict[str, Any] | None, questions: dict[str, 
         return None
     answers = raw_response.get("answers", {})
     result: dict[str, Any] = {}
-    for key in ("provenance_verdict", "data_egress_policy", "privilege_scope_check"):
+    for key in questions.keys():
         answer = answers.get(key) if isinstance(answers, dict) else None
         if not isinstance(answer, dict):
             result[key] = None
