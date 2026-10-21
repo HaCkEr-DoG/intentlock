@@ -61,7 +61,7 @@ except ImportError:
     BeforeToolCallEvent = Any  # type: ignore[misc,assignment]
 
 
-POLICY_VERSION = "2026.10.6"
+POLICY_VERSION = "2026.10.7"
 DEFAULT_CHECKPOINT = "StrandsAgents/strands-decider-2B-qwen3.5-v1-2610"
 
 # ---------------------------------------------------------------------------
@@ -658,6 +658,9 @@ class IntentLockPolicyHandler(InterventionHandler):
         )
         self._retry_counts: dict[str, int] = {}
         self.audit_log: list[dict[str, Any]] = []
+        # Compact log of prior tool calls included in each envelope so Decider
+        # can reason about trajectory, not just the current call in isolation.
+        self._session_ops: list[dict[str, Any]] = []
 
     def before_invocation(self, event: BeforeInvocationEvent, **kwargs: Any):
         self._retry_counts.clear()
@@ -748,6 +751,22 @@ class IntentLockPolicyHandler(InterventionHandler):
         else:
             trace_lines = "  (no string arguments to trace)"
 
+        # Session operation history — last 5 calls so Decider can detect
+        # trajectory-based threats (incremental scope creep, read-then-exfil).
+        prior_ops = self._session_ops[-5:] if self._session_ops else []
+        if prior_ops:
+            session_lines = "\n".join(
+                f"  {i+1}. {op['tool']} → {op['outcome']}"
+                + (
+                    f" (prov={op['prov']}, egress={op['egress']})"
+                    if op.get("prov")
+                    else ""
+                )
+                for i, op in enumerate(prior_ops)
+            )
+        else:
+            session_lines = "  (first call in this session)"
+
         return (
             f"[WRITTEN POLICY]\n{self.context.written_policy}\n\n"
             f"[TRUSTED OPERATOR DIRECTIVE]\n"
@@ -756,6 +775,8 @@ class IntentLockPolicyHandler(InterventionHandler):
             f"Authorized Environments: {sorted(self.context.allowed_environments)}\n"
             f"Authorized Resources: {sorted(self.context.owned_resources)}\n"
             f"Directive: {directive}\n\n"
+            f"[SESSION HISTORY (last {len(prior_ops)} of {len(self._session_ops)} calls)]\n"
+            f"{session_lines}\n\n"
             f"[UNTRUSTED EXTERNAL DATA]\n{untrusted_section}\n\n"
             f"[PROPOSED TOOL CALL]\n"
             f"Tool: {tool_name}\n"
@@ -1206,6 +1227,8 @@ class IntentLockPolicyHandler(InterventionHandler):
         injection_signal: bool,
         arg_align_answer: str | None = None,
         arg_align_conf: float = 0.0,
+        p_injection: float = 0.0,
+        p_egress_bad: float = 0.0,
     ) -> float:
         """
         Composite 0–1 threat score fusing all available signals for a single call.
@@ -1214,8 +1237,9 @@ class IntentLockPolicyHandler(InterventionHandler):
         Components:
           injection pre-scan       0.25   (binary)
           provenance choice        0–0.30 (untrusted_injection → max)
-          confidence gap           0–0.15 (1 - min(prov_conf, egress_conf))
+          soft injection prob      0–0.15 (raw p_injection when not top choice)
           egress choice            0–0.30 (unauthorized_egress → max)
+          soft egress prob         0–0.10 (raw p_egress_bad when not top choice)
           privilege choice         0–0.25 (privilege_escalation → max)
           arg value misalignment   0–0.20 (novel values = substitution signal)
           session risk bleed       0–0.15 (scaled session_risk_score)
@@ -1230,26 +1254,30 @@ class IntentLockPolicyHandler(InterventionHandler):
         elif prov_choice == "ungrounded_guess":
             score += 0.10
         else:
-            score += max(0.0, (1.0 - prov_conf) * 0.15)
+            # Even when the top choice is "trusted", a meaningful injection
+            # probability in the distribution is a real signal.
+            score += max(
+                max(0.0, (1.0 - prov_conf) * 0.15),
+                p_injection * 0.15,
+            )
 
         if egress_choice == "unauthorized_egress":
             score += 0.30
         elif egress_choice == "ambiguous_scope":
             score += 0.10
         else:
-            score += max(0.0, (1.0 - egress_conf) * 0.10)
+            score += max(
+                max(0.0, (1.0 - egress_conf) * 0.10),
+                p_egress_bad * 0.10,
+            )
 
         if priv_choice == "privilege_escalation":
             score += 0.25
         elif priv_choice == "scope_expansion":
             score += 0.08
 
-        # Novel argument values are a direct signal of value-substitution injection.
-        # Weight by Decider's confidence that the values don't match the directive.
         if arg_align_answer == "no":
             score += arg_align_conf * 0.20
-        elif arg_align_answer is None:
-            pass  # question not answered — no signal either way
 
         score += self.session_risk.risk_score * 0.15
 
@@ -1465,8 +1493,10 @@ class IntentLockPolicyHandler(InterventionHandler):
         # ── STAGE 3: Most-restrictive-wins mapping ──────────────────────────
         prov_choice = egress_choice = priv_choice = None
         prov_conf = egress_conf = priv_conf = 0.0
-        arg_align_answer: str | None = None   # "yes" | "no" | None
+        arg_align_answer: str | None = None
         arg_align_conf: float = 0.0
+        p_injection: float = 0.0
+        p_egress_bad: float = 0.0
 
         if not isinstance(answers, dict):
             reason = "Malformed Decider response: missing answers object."
@@ -1533,7 +1563,7 @@ class IntentLockPolicyHandler(InterventionHandler):
                         arg_misalignment_deny = (
                             arg_align_answer == "no"
                             and arg_align_conf >= effective_threshold
-                            and bool(injection_hits)  # injection pre-scan already fired
+                            and bool(injection_hits)
                         )
                         arg_misalignment_confirm = (
                             arg_align_answer == "no"
@@ -1541,11 +1571,43 @@ class IntentLockPolicyHandler(InterventionHandler):
                             and not injection_hits
                         )
 
+                        # ── Soft-signal detection from the raw probability distribution ──
+                        #
+                        # The argmax alone throws away information. If the model chose
+                        # "trusted_operator" with 55% but assigned 40% to "untrusted_injection",
+                        # that 40% is a material signal that should change the outcome.
+                        #
+                        # Soft-inject thresholds (below the top-choice bar):
+                        #   p_injection > 0.30  →  treat as a soft injection signal
+                        #   p_egress_bad > 0.30  →  treat as a soft egress signal
+                        # Combined with any corroborating signal → escalate to Deny.
+                        # Without corroboration → escalate to Confirm.
+                        p_injection = safe_probability(prov_probs, "untrusted_injection")
+                        p_egress_bad = safe_probability(egress_probs, "unauthorized_egress")
+                        _SOFT_SIGNAL_THRESHOLD = 0.30
+
+                        soft_injection = (
+                            p_injection > _SOFT_SIGNAL_THRESHOLD
+                            and prov_choice != "untrusted_injection"
+                        )
+                        soft_egress = (
+                            p_egress_bad > _SOFT_SIGNAL_THRESHOLD
+                            and egress_choice != "unauthorized_egress"
+                        )
+                        # Corroboration: two soft signals, or soft + hard injection evidence
+                        soft_deny = (
+                            (soft_injection and soft_egress)
+                            or (soft_injection and bool(injection_hits))
+                            or (soft_egress and bool(injection_hits))
+                        )
+                        soft_confirm = (soft_injection or soft_egress) and not soft_deny
+
                         escalation = (
                             prov_choice == "untrusted_injection"
                             or egress_choice == "unauthorized_egress"
                             or priv_choice == "privilege_escalation"
                             or arg_misalignment_deny
+                            or soft_deny
                         )
                         if escalation:
                             reason = (
@@ -1571,6 +1633,7 @@ class IntentLockPolicyHandler(InterventionHandler):
                             egress_choice == "ambiguous_scope"
                             or priv_choice == "scope_expansion"
                             or arg_misalignment_confirm
+                            or soft_confirm
                             or prov_conf < effective_threshold
                             or egress_conf < effective_threshold
                             or (priv_choice is not None and priv_conf < effective_threshold)
@@ -1640,7 +1703,10 @@ class IntentLockPolicyHandler(InterventionHandler):
                 prov_choice, prov_conf, egress_choice, egress_conf,
                 priv_choice, priv_conf, bool(injection_hits),
                 arg_align_answer, arg_align_conf,
+                p_injection, p_egress_bad,
             ),
+            "p_injection": round(p_injection, 4),
+            "p_egress_bad": round(p_egress_bad, 4),
             "session_risk_score": round(self.session_risk.risk_score, 4),
             "session_call_count": self.session_risk.call_count,
             "outcome": final_type,
@@ -1652,6 +1718,12 @@ class IntentLockPolicyHandler(InterventionHandler):
             "latency_ms": round(decider_ms, 2),
         }
         self.audit_log.append(record)
+        self._session_ops.append({
+            "tool": tool_name,
+            "outcome": final_type,
+            "prov": prov_choice,
+            "egress": egress_choice,
+        })
         return final_type, action_obj, record
 
     def before_tool_call(self, event: BeforeToolCallEvent, **kwargs: Any):
