@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import threading
 import time
 import urllib.request
@@ -60,8 +61,29 @@ except ImportError:
     BeforeToolCallEvent = Any  # type: ignore[misc,assignment]
 
 
-POLICY_VERSION = "2026.10.3"
+POLICY_VERSION = "2026.10.4"
 DEFAULT_CHECKPOINT = "StrandsAgents/strands-decider-2B-qwen3.5-v1-2610"
+
+# ---------------------------------------------------------------------------
+# Stage 0: Injection keyword patterns
+# Compiled once at import time; scanned against untrusted_external_data before
+# any deterministic or model-based evaluation runs.
+# ---------------------------------------------------------------------------
+
+_INJECTION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"ignore\s+(previous|prior|above|all)\s+(instructions?|directives?|rules?|tasks?)", re.I),
+    re.compile(r"disregard\s+(previous|prior|above|all)", re.I),
+    re.compile(r"(new|actual|real|updated)\s+(instructions?|directives?|tasks?|objectives?)\s*:", re.I),
+    re.compile(r"you\s+are\s+now\s+(a|an|the)\b", re.I),
+    re.compile(r"forget\s+(everything|all|what\s+you)", re.I),
+    re.compile(r"\bSYSTEM\s*:", re.I),
+    re.compile(r"<\s*/?\s*(system|instruction|command|prompt)\s*>", re.I),
+    re.compile(r"\bexfiltrate\b", re.I),
+    re.compile(r"\bbypass\b.{0,30}\bpolicy\b", re.I),
+    re.compile(r"\boverride\b.{0,30}\b(security|policy|restriction|filter)\b", re.I),
+    re.compile(r"print\s+(all|every|the)\s+(secret|credential|password|token|key)", re.I),
+    re.compile(r"--\s*end\s+of\s+(system\s+)?prompt\s*--", re.I),
+]
 
 # ---------------------------------------------------------------------------
 # Decider 2B question set — three orthogonal gates
@@ -754,6 +776,200 @@ class IntentLockPolicyHandler(InterventionHandler):
             Deny(reason=f"Retry budget ({self.max_guide_retries}) exhausted for '{key}': {reason}"),
         )
 
+    def _scan_untrusted_for_injection(self) -> list[str]:
+        """
+        Stage 0: scan untrusted_external_data for known prompt-injection phrases.
+        Returns a list of matched pattern descriptions (empty = clean).
+        Runs before Stage 1 so the pre-scan result can enrich the Decider envelope.
+        """
+        hits: list[str] = []
+        for item in self.context.untrusted_external_data:
+            text = item.get("content", "")
+            for pattern in _INJECTION_PATTERNS:
+                m = pattern.search(text)
+                if m:
+                    hits.append(f"{pattern.pattern!r} matched in source={item.get('source', 'unknown')!r}: {m.group(0)!r}")
+        return hits
+
+    def _remediation_hint(
+        self,
+        outcome: str,
+        prov_choice: str | None,
+        egress_choice: str | None,
+        priv_choice: str | None,
+    ) -> str:
+        """One actionable sentence for the operator based on what triggered the decision."""
+        if outcome == "Deny":
+            if prov_choice == "untrusted_injection":
+                return (
+                    "Sanitize or exclude external data sources before retrying; "
+                    "trace which retrieved content introduced the injected value."
+                )
+            if egress_choice == "unauthorized_egress":
+                return (
+                    "Verify the target destination is in the operator's approved allowlist; "
+                    "do not retry until the destination is confirmed safe."
+                )
+            if priv_choice == "privilege_escalation":
+                return (
+                    "The operator directive must explicitly authorize this capability level; "
+                    "obtain written approval before expanding scope."
+                )
+        if outcome == "Confirm":
+            if egress_choice == "ambiguous_scope":
+                return "Clarify the destination environment and resource scope with the operator before proceeding."
+            if priv_choice == "scope_expansion":
+                return "Get explicit operator sign-off for this capability extension before allowing the call."
+            return "Re-confirm the full intent with the operator; confidence was too low to proceed automatically."
+        if outcome == "Guide":
+            return (
+                "Ask the operator to supply the missing or ambiguous parameters explicitly "
+                "before the next attempt."
+            )
+        if outcome == "Proceed":
+            return "No action required — all policy dimensions cleared."
+        return "Review the audit record and consult the written policy before retrying."
+
+    def classify_session_threats(self) -> dict[str, Any]:
+        """
+        Analyse the session audit log and classify detected threat patterns.
+
+        Returns a dict with:
+          threat_types     list[str]  — named patterns detected (may be empty)
+          highest_severity str        — 'critical' | 'elevated' | 'low' | 'none'
+          evidence         dict       — per-pattern counts that triggered classification
+        """
+        prov_counts: dict[str, int] = {}
+        egress_counts: dict[str, int] = {}
+        priv_counts: dict[str, int] = {}
+        injection_signals = 0
+
+        for rec in self.audit_log:
+            prov = rec.get("provenance_choice")
+            egress = rec.get("egress_choice")
+            priv = rec.get("privilege_choice")
+            if prov:
+                prov_counts[prov] = prov_counts.get(prov, 0) + 1
+            if egress:
+                egress_counts[egress] = egress_counts.get(egress, 0) + 1
+            if priv:
+                priv_counts[priv] = priv_counts.get(priv, 0) + 1
+            if rec.get("injection_signal"):
+                injection_signals += 1
+
+        threats: list[str] = []
+
+        if prov_counts.get("untrusted_injection", 0) >= 1 or injection_signals >= 1:
+            threats.append("prompt_injection_attempt")
+
+        if egress_counts.get("unauthorized_egress", 0) >= 1:
+            threats.append("data_exfiltration_attempt")
+
+        scope_exp = priv_counts.get("scope_expansion", 0)
+        priv_esc = priv_counts.get("privilege_escalation", 0)
+        if scope_exp >= 1 and priv_esc >= 1:
+            threats.append("privilege_escalation_chain")
+        elif priv_esc >= 1:
+            threats.append("privilege_escalation_attempt")
+        elif scope_exp >= 2:
+            threats.append("scope_creep")
+
+        if prov_counts.get("ungrounded_guess", 0) >= 2:
+            threats.append("ungrounded_agent")
+
+        severity_map = {
+            "prompt_injection_attempt": "critical",
+            "data_exfiltration_attempt": "critical",
+            "privilege_escalation_chain": "critical",
+            "privilege_escalation_attempt": "elevated",
+            "scope_creep": "elevated",
+            "ungrounded_agent": "low",
+        }
+        severity_order = ["critical", "elevated", "low", "none"]
+        highest = "none"
+        for t in threats:
+            s = severity_map.get(t, "low")
+            if severity_order.index(s) < severity_order.index(highest):
+                highest = s
+
+        return {
+            "threat_types": threats,
+            "highest_severity": highest,
+            "evidence": {
+                "provenance_counts": prov_counts,
+                "egress_counts": egress_counts,
+                "privilege_counts": priv_counts,
+                "injection_pre_scan_hits": injection_signals,
+            },
+        }
+
+    def generate_report(self) -> dict[str, Any]:
+        """
+        Produce a full session threat-intelligence report.
+
+        Suitable for display at the end of a demo or for writing to an audit store.
+        Keys: session_stats, risk_trajectory, threats, top_recommendations, audit_summary.
+        """
+        if not self.audit_log:
+            return {"error": "No tool calls recorded in this session."}
+
+        outcome_counts: dict[str, int] = {}
+        stage_counts: dict[str, int] = {}
+        risk_snapshots: list[float] = []
+
+        for rec in self.audit_log:
+            o = rec.get("outcome", "Unknown")
+            outcome_counts[o] = outcome_counts.get(o, 0) + 1
+            s = rec.get("stage_resolved", "Unknown")
+            stage_counts[s] = stage_counts.get(s, 0) + 1
+            risk_val = rec.get("session_risk_score")
+            if isinstance(risk_val, (int, float)):
+                risk_snapshots.append(float(risk_val))
+
+        threat_analysis = self.classify_session_threats()
+
+        recommendations: list[str] = []
+        for rec in self.audit_log:
+            hint = rec.get("remediation")
+            if hint and hint not in recommendations and rec.get("outcome") in ("Deny", "Confirm"):
+                recommendations.append(hint)
+        recommendations = recommendations[:5]  # top 5
+
+        total_calls = len(self.audit_log)
+        denied = outcome_counts.get("Deny", 0)
+        block_rate = round(denied / total_calls, 3) if total_calls else 0.0
+
+        avg_latency = 0.0
+        latencies = [r.get("latency_ms", 0) for r in self.audit_log if r.get("latency_ms")]
+        if latencies:
+            avg_latency = round(sum(latencies) / len(latencies), 2)
+
+        return {
+            "policy_version": POLICY_VERSION,
+            "session_stats": {
+                "total_calls": total_calls,
+                "outcome_counts": outcome_counts,
+                "block_rate": block_rate,
+                "avg_latency_ms": avg_latency,
+                "stage_breakdown": stage_counts,
+            },
+            "risk_trajectory": risk_snapshots,
+            "final_risk_score": round(self.session_risk.risk_score, 4),
+            "session_locked": self.session_risk.is_locked,
+            "threats": threat_analysis,
+            "top_recommendations": recommendations,
+            "audit_summary": [
+                {
+                    "call": i + 1,
+                    "tool": r.get("tool"),
+                    "outcome": r.get("outcome"),
+                    "explanation": r.get("explanation"),
+                    "risk_after": r.get("session_risk_score"),
+                }
+                for i, r in enumerate(self.audit_log)
+            ],
+        }
+
     def _synthesize_explanation(
         self,
         final_type: str,
@@ -828,6 +1044,8 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "consecutive_failures": self.client.consecutive_failures,
                 "state_chars": 0,
                 "state_tokens_est": 0,
+                "injection_signal": False,
+                "injection_hits": [],
                 "provenance_choice": None,
                 "provenance_conf": None,
                 "egress_choice": None,
@@ -839,10 +1057,18 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "outcome": final_type,
                 "reason": reason,
                 "explanation": f"Session locked after {self.session_risk.call_count} calls with cumulative risk {self.session_risk.risk_score:.2f}.",
+                "remediation": "Terminate this agent session and start a new one with a clean operator directive.",
                 "latency_ms": round(total_ms, 3),
             }
             self.audit_log.append(record)
             return final_type, action_obj, record
+
+        # ── STAGE 0: Injection pre-scan ────────────────────────────────────
+        injection_hits = self._scan_untrusted_for_injection()
+        if injection_hits:
+            # Pre-bump session risk — the untrusted data looks hostile even
+            # before Decider evaluates the specific call.
+            self.session_risk.update("Confirm")
 
         # ── STAGE 1: Deterministic ──────────────────────────────────────────
         stage1_outcome, stage1_reason = self._check_stage1_deterministic(tool_name, tool_args)
@@ -868,6 +1094,8 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "consecutive_failures": self.client.consecutive_failures,
                 "state_chars": 0,
                 "state_tokens_est": 0,
+                "injection_signal": bool(injection_hits),
+                "injection_hits": injection_hits[:3],
                 "provenance_choice": None,
                 "provenance_conf": None,
                 "egress_choice": None,
@@ -879,6 +1107,7 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "outcome": final_type,
                 "reason": stage1_reason,
                 "explanation": self._synthesize_explanation(final_type, None, None, None, stage1_reason),
+                "remediation": self._remediation_hint(final_type, None, None, None),
                 "latency_ms": round(total_ms, 3),
             }
             self.audit_log.append(record)
@@ -911,6 +1140,8 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "consecutive_failures": self.client.consecutive_failures,
                 "state_chars": len(envelope),
                 "state_tokens_est": max(1, len(envelope) // 4),
+                "injection_signal": bool(injection_hits),
+                "injection_hits": injection_hits[:3],
                 "provenance_choice": None,
                 "provenance_conf": None,
                 "egress_choice": None,
@@ -922,6 +1153,7 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "outcome": final_type,
                 "reason": reason,
                 "explanation": "Decider 2B server was unreachable; applied fail-closed policy.",
+                "remediation": "Bring the Decider server back online; do not switch to fail-open in production.",
                 "latency_ms": round(total_ms, 3),
             }
             self.audit_log.append(record)
@@ -1066,6 +1298,8 @@ class IntentLockPolicyHandler(InterventionHandler):
             "consecutive_failures": self.client.consecutive_failures,
             "state_chars": len(envelope),
             "state_tokens_est": max(1, len(envelope) // 4),
+            "injection_signal": bool(injection_hits),
+            "injection_hits": injection_hits[:3],
             "provenance_choice": prov_choice,
             "provenance_conf": round(prov_conf, 4),
             "egress_choice": egress_choice,
@@ -1079,6 +1313,7 @@ class IntentLockPolicyHandler(InterventionHandler):
             "explanation": self._synthesize_explanation(
                 final_type, prov_choice, egress_choice, priv_choice
             ),
+            "remediation": self._remediation_hint(final_type, prov_choice, egress_choice, priv_choice),
             "latency_ms": round(decider_ms, 2),
         }
         self.audit_log.append(record)
