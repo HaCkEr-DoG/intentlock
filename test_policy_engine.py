@@ -8,6 +8,7 @@ from intentlock.policy_engine import (
     INTENTLOCK_QUESTIONS,
     IntentLockPolicyHandler,
     ProvenanceContext,
+    SessionRiskTracker,
     compute_config_digest,
     DeciderUnavailableError,
     AbstractDryRunLedger,
@@ -249,6 +250,76 @@ class PolicyEngineTests(unittest.TestCase):
         decision, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
         self.assertEqual(decision, "Proceed")
         self.assertTrue(record["decider_invoked"])
+
+
+    def test_audit_record_contains_explanation(self):
+        client = FakeClient()
+        handler = IntentLockPolicyHandler(client, context())
+        _, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertIn("explanation", record)
+        self.assertIsInstance(record["explanation"], str)
+        self.assertGreater(len(record["explanation"]), 10)
+
+    def test_audit_record_contains_session_risk_fields(self):
+        client = FakeClient()
+        handler = IntentLockPolicyHandler(client, context())
+        _, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertIn("session_risk_score", record)
+        self.assertIn("session_call_count", record)
+        self.assertIsInstance(record["session_risk_score"], float)
+        self.assertEqual(record["session_call_count"], 1)
+
+    def test_session_risk_accumulates_on_denials(self):
+        client = FakeClient(provenance="untrusted_injection")
+        handler = IntentLockPolicyHandler(client, context())
+        for _ in range(3):
+            handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertGreater(handler.session_risk.risk_score, 0.45)
+
+    def test_session_lock_denies_after_threshold(self):
+        # Three hard Denies push score to 0.90, which exceeds lockout_threshold=0.75
+        client = FakeClient(provenance="untrusted_injection")
+        handler = IntentLockPolicyHandler(client, context(), lockout_threshold=0.75)
+        for _ in range(3):
+            handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertTrue(handler.session_risk.is_locked)
+        # A 4th call with a clean client should still be denied (session locked)
+        clean_client = FakeClient()
+        handler.client = clean_client
+        decision, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertEqual(decision, "Deny")
+        self.assertEqual(record["stage_resolved"], "Session Lock")
+        self.assertEqual(clean_client.calls, 0)  # Decider was never invoked
+
+    def test_session_risk_adaptive_threshold_raises_bar(self):
+        # After a Deny, risk = 0.30; threshold = 0.45. Score < threshold so base threshold still used.
+        # After two Denies, risk = 0.60 >= 0.45 threshold -> effective_threshold = base + 0.15
+        tracker = SessionRiskTracker(risk_threshold=0.45)
+        tracker.update("Deny")
+        tracker.update("Deny")
+        # Score should be 0.60
+        self.assertAlmostEqual(tracker.risk_score, 0.60, places=5)
+        # effective_threshold should be base + 0.15
+        self.assertAlmostEqual(tracker.effective_confidence_threshold(0.70), 0.85, places=5)
+
+    def test_session_risk_proceeds_reduce_score(self):
+        tracker = SessionRiskTracker()
+        tracker.update("Deny")   # +0.30 → 0.30
+        tracker.update("Proceed") # -0.02 → 0.28
+        self.assertAlmostEqual(tracker.risk_score, 0.28, places=5)
+
+    def test_proceed_explanation_is_affirmative(self):
+        client = FakeClient()
+        handler = IntentLockPolicyHandler(client, context())
+        _, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertIn("cleared", record["explanation"].lower())
+
+    def test_deny_explanation_cites_cause(self):
+        client = FakeClient(provenance="untrusted_injection")
+        handler = IntentLockPolicyHandler(client, context())
+        _, _, record = handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        self.assertIn("denied", record["explanation"].lower())
+        self.assertIn("untrusted", record["explanation"].lower())
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from .policy_engine import (
     DryRunRecord,
     ProvenanceContext,
     LocalDeciderClient,
+    SessionRiskTracker,
     IntentLockPolicyHandler,
     compute_config_digest,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "DryRunRecord",
     "ProvenanceContext",
     "LocalDeciderClient",
+    "SessionRiskTracker",
     "IntentLockPolicyHandler",
     "compute_config_digest",
 ]

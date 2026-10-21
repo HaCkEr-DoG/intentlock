@@ -60,7 +60,7 @@ except ImportError:
     BeforeToolCallEvent = Any  # type: ignore[misc,assignment]
 
 
-POLICY_VERSION = "2026.10.2"
+POLICY_VERSION = "2026.10.3"
 DEFAULT_CHECKPOINT = "StrandsAgents/strands-decider-2B-qwen3.5-v1-2610"
 
 # ---------------------------------------------------------------------------
@@ -490,6 +490,75 @@ class LocalDeciderClient:
 
 
 # ---------------------------------------------------------------------------
+# Session-level risk accumulation
+# ---------------------------------------------------------------------------
+
+class SessionRiskTracker:
+    """
+    Accumulates evidence of suspicious behaviour across tool calls in a session.
+
+    Most per-call policy engines evaluate each call in isolation; this tracker
+    catches slow-and-low attacks where individual calls appear borderline but
+    together form a suspicious pattern.
+
+    Risk model (after each resolved call):
+      Deny    → +0.30  (strong signal)
+      Confirm → +0.12  (needs investigation)
+      Guide   → +0.04  (ungrounded guess — minor suspicion)
+      Proceed → -0.02  (each clean call slightly reduces score)
+      Score clamped to [0.0, 1.0]
+
+    Above risk_threshold (default 0.45):
+      confidence_threshold is raised by +0.15 — harder to get a Proceed.
+
+    Above lockout_threshold (default 0.75):
+      All subsequent calls are denied immediately ("session locked").
+    """
+
+    RISK_DELTAS: dict[str, float] = {
+        "Deny": 0.30,
+        "Confirm": 0.12,
+        "Guide": 0.04,
+        "Proceed": -0.02,
+    }
+
+    def __init__(
+        self,
+        risk_threshold: float = 0.45,
+        lockout_threshold: float = 0.75,
+    ) -> None:
+        self.risk_threshold = risk_threshold
+        self.lockout_threshold = lockout_threshold
+        self._risk_score: float = 0.0
+        self._call_count: int = 0
+        self._lock = threading.Lock()
+
+    def update(self, outcome: str) -> None:
+        delta = self.RISK_DELTAS.get(outcome, 0.0)
+        with self._lock:
+            self._risk_score = max(0.0, min(1.0, self._risk_score + delta))
+            self._call_count += 1
+
+    @property
+    def risk_score(self) -> float:
+        return self._risk_score
+
+    @property
+    def call_count(self) -> int:
+        return self._call_count
+
+    @property
+    def is_locked(self) -> bool:
+        return self._risk_score >= self.lockout_threshold
+
+    def effective_confidence_threshold(self, base: float) -> float:
+        """Raise threshold when session risk is elevated."""
+        if self._risk_score >= self.risk_threshold:
+            return min(base + 0.15, 0.95)
+        return base
+
+
+# ---------------------------------------------------------------------------
 # Policy handler
 # ---------------------------------------------------------------------------
 
@@ -514,12 +583,18 @@ class IntentLockPolicyHandler(InterventionHandler):
         confidence_threshold: float = 0.70,
         max_guide_retries: int = 1,
         fail_open: bool = False,
+        risk_threshold: float = 0.45,
+        lockout_threshold: float = 0.75,
     ) -> None:
         self.client = client
         self.context = context
         self.confidence_threshold = confidence_threshold
         self.max_guide_retries = max_guide_retries
         self.fail_open = fail_open
+        self.session_risk = SessionRiskTracker(
+            risk_threshold=risk_threshold,
+            lockout_threshold=lockout_threshold,
+        )
         self._retry_counts: dict[str, int] = {}
         self.audit_log: list[dict[str, Any]] = []
 
@@ -679,10 +754,95 @@ class IntentLockPolicyHandler(InterventionHandler):
             Deny(reason=f"Retry budget ({self.max_guide_retries}) exhausted for '{key}': {reason}"),
         )
 
+    def _synthesize_explanation(
+        self,
+        final_type: str,
+        prov_choice: str | None,
+        egress_choice: str | None,
+        priv_choice: str | None,
+        stage1_reason: str | None = None,
+    ) -> str:
+        """Produce a single human-readable sentence explaining the decision."""
+        if stage1_reason:
+            short = stage1_reason[:200]
+            return f"Blocked at Stage 1 (deterministic rule): {short}"
+
+        triggers: list[str] = []
+        if prov_choice == "untrusted_injection":
+            triggers.append("parameter origin traced to untrusted external data")
+        elif prov_choice == "ungrounded_guess":
+            triggers.append("parameter values have no grounding in the operator directive")
+
+        if egress_choice == "unauthorized_egress":
+            triggers.append("operation would send data to an unauthorized destination")
+        elif egress_choice == "ambiguous_scope":
+            triggers.append("destination or scope is underspecified")
+
+        if priv_choice == "privilege_escalation":
+            triggers.append("requested capability exceeds authorized scope")
+        elif priv_choice == "scope_expansion":
+            triggers.append("capability extends beyond what the directive explicitly covered")
+
+        if not triggers:
+            if final_type == "Proceed":
+                return (
+                    "All three policy dimensions cleared: trusted source, "
+                    "internal scope, authorized privilege."
+                )
+            return f"Outcome: {final_type} (no specific trigger identified)."
+
+        trigger_str = "; ".join(triggers)
+        if final_type == "Deny":
+            return f"Denied because: {trigger_str}."
+        if final_type == "Confirm":
+            return f"Confirmation required because: {trigger_str}."
+        if final_type == "Guide":
+            return f"Guidance needed because: {trigger_str}."
+        return f"{final_type}: {trigger_str}."
+
     def evaluate_tool_call(
         self, tool_name: str, tool_args: dict[str, Any]
     ) -> tuple[str, Any, dict[str, Any]]:
         t_start = time.perf_counter()
+
+        # ── SESSION LOCK CHECK ──────────────────────────────────────────────
+        if self.session_risk.is_locked:
+            total_ms = (time.perf_counter() - t_start) * 1000.0
+            reason = (
+                f"Session locked: accumulated risk score "
+                f"{self.session_risk.risk_score:.2f} ≥ lockout threshold "
+                f"{self.session_risk.lockout_threshold:.2f}. "
+                "Too many suspicious interactions in this session."
+            )
+            final_type, action_obj = "Deny", Deny(reason=reason)
+            self.session_risk.update(final_type)
+            record: dict[str, Any] = {
+                "policy_version": POLICY_VERSION,
+                "checkpoint": self.client.checkpoint,
+                "tool": tool_name,
+                "stage_resolved": "Session Lock",
+                "decider_invoked": False,
+                "cache_hit": False,
+                "was_cold_start": False,
+                "circuit_open": self.client.circuit_open,
+                "consecutive_failures": self.client.consecutive_failures,
+                "state_chars": 0,
+                "state_tokens_est": 0,
+                "provenance_choice": None,
+                "provenance_conf": None,
+                "egress_choice": None,
+                "egress_conf": None,
+                "privilege_choice": None,
+                "privilege_conf": None,
+                "session_risk_score": round(self.session_risk.risk_score, 4),
+                "session_call_count": self.session_risk.call_count,
+                "outcome": final_type,
+                "reason": reason,
+                "explanation": f"Session locked after {self.session_risk.call_count} calls with cumulative risk {self.session_risk.risk_score:.2f}.",
+                "latency_ms": round(total_ms, 3),
+            }
+            self.audit_log.append(record)
+            return final_type, action_obj, record
 
         # ── STAGE 1: Deterministic ──────────────────────────────────────────
         stage1_outcome, stage1_reason = self._check_stage1_deterministic(tool_name, tool_args)
@@ -695,6 +855,7 @@ class IntentLockPolicyHandler(InterventionHandler):
             else:
                 final_type, action_obj = "Deny", Deny(reason=stage1_reason)
 
+            self.session_risk.update(final_type)
             record: dict[str, Any] = {
                 "policy_version": POLICY_VERSION,
                 "checkpoint": self.client.checkpoint,
@@ -713,8 +874,11 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "egress_conf": None,
                 "privilege_choice": None,
                 "privilege_conf": None,
+                "session_risk_score": round(self.session_risk.risk_score, 4),
+                "session_call_count": self.session_risk.call_count,
                 "outcome": final_type,
                 "reason": stage1_reason,
+                "explanation": self._synthesize_explanation(final_type, None, None, None, stage1_reason),
                 "latency_ms": round(total_ms, 3),
             }
             self.audit_log.append(record)
@@ -734,6 +898,7 @@ class IntentLockPolicyHandler(InterventionHandler):
             else:
                 reason = f"Decider unavailable (fail-closed): {exc}"
                 final_type, action_obj = "Deny", Deny(reason=reason)
+            self.session_risk.update(final_type)
             record = {
                 "policy_version": POLICY_VERSION,
                 "checkpoint": self.client.checkpoint,
@@ -752,8 +917,11 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "egress_conf": None,
                 "privilege_choice": None,
                 "privilege_conf": None,
+                "session_risk_score": round(self.session_risk.risk_score, 4),
+                "session_call_count": self.session_risk.call_count,
                 "outcome": final_type,
                 "reason": reason,
+                "explanation": "Decider 2B server was unreachable; applied fail-closed policy.",
                 "latency_ms": round(total_ms, 3),
             }
             self.audit_log.append(record)
@@ -812,6 +980,11 @@ class IntentLockPolicyHandler(InterventionHandler):
                         final_type, action_obj = "Deny", Deny(reason=reason)
                     else:
                         # ── Most-restrictive-wins ──────────────────────────
+                        # Adaptive threshold: elevated session risk raises the bar.
+                        effective_threshold = self.session_risk.effective_confidence_threshold(
+                            self.confidence_threshold
+                        )
+
                         escalation = (
                             prov_choice == "untrusted_injection"
                             or egress_choice == "unauthorized_egress"
@@ -840,16 +1013,22 @@ class IntentLockPolicyHandler(InterventionHandler):
                         elif (
                             egress_choice == "ambiguous_scope"
                             or priv_choice == "scope_expansion"
-                            or prov_conf < self.confidence_threshold
-                            or egress_conf < self.confidence_threshold
-                            or (priv_choice is not None and priv_conf < self.confidence_threshold)
+                            or prov_conf < effective_threshold
+                            or egress_conf < effective_threshold
+                            or (priv_choice is not None and priv_conf < effective_threshold)
                         ):
+                            risk_note = (
+                                f" [session_risk={self.session_risk.risk_score:.2f}, "
+                                f"threshold_used={effective_threshold:.2f}]"
+                                if self.session_risk.risk_score >= self.session_risk.risk_threshold
+                                else ""
+                            )
                             reason = (
                                 f"Operator confirmation required for '{tool_name}' "
                                 f"(provenance={prov_choice}@{prov_conf:.2f}, "
                                 f"egress={egress_choice}@{egress_conf:.2f}"
                                 + (f", privilege={priv_choice}@{priv_conf:.2f}" if priv_choice else "")
-                                + ")."
+                                + f"){risk_note}."
                             )
                             final_type, action_obj = "Confirm", Confirm(reason=reason)
 
@@ -874,6 +1053,7 @@ class IntentLockPolicyHandler(InterventionHandler):
                             )
                             final_type, action_obj = "Deny", Deny(reason=reason)
 
+        self.session_risk.update(final_type)
         record = {
             "policy_version": POLICY_VERSION,
             "checkpoint": self.client.checkpoint,
@@ -892,8 +1072,13 @@ class IntentLockPolicyHandler(InterventionHandler):
             "egress_conf": round(egress_conf, 4),
             "privilege_choice": priv_choice,
             "privilege_conf": round(priv_conf, 4) if priv_choice else None,
+            "session_risk_score": round(self.session_risk.risk_score, 4),
+            "session_call_count": self.session_risk.call_count,
             "outcome": final_type,
             "reason": reason,
+            "explanation": self._synthesize_explanation(
+                final_type, prov_choice, egress_choice, priv_choice
+            ),
             "latency_ms": round(decider_ms, 2),
         }
         self.audit_log.append(record)
