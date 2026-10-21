@@ -61,7 +61,7 @@ except ImportError:
     BeforeToolCallEvent = Any  # type: ignore[misc,assignment]
 
 
-POLICY_VERSION = "2026.10.4"
+POLICY_VERSION = "2026.10.5"
 DEFAULT_CHECKPOINT = "StrandsAgents/strands-decider-2B-qwen3.5-v1-2610"
 
 # ---------------------------------------------------------------------------
@@ -280,6 +280,9 @@ class ProvenanceContext:
     denylisted_destinations: set[str] = field(
         default_factory=lambda: {"s3://attacker-bucket", "attacker@example.com"}
     )
+    # Any tool argument key in this set triggers a deterministic Confirm in Stage 1.
+    # Use it for credentials, tokens, private keys, PII fields, etc.
+    sensitive_parameters: set[str] = field(default_factory=set)
     untrusted_external_data: list[dict[str, str]] = field(default_factory=list)
     dry_run_ttl_seconds: float = 300.0
 
@@ -548,11 +551,16 @@ class SessionRiskTracker:
         self,
         risk_threshold: float = 0.45,
         lockout_threshold: float = 0.75,
+        velocity_window_seconds: float = 60.0,
+        velocity_max_calls: int = 15,
     ) -> None:
         self.risk_threshold = risk_threshold
         self.lockout_threshold = lockout_threshold
+        self.velocity_window_seconds = velocity_window_seconds
+        self.velocity_max_calls = velocity_max_calls
         self._risk_score: float = 0.0
         self._call_count: int = 0
+        self._call_timestamps: list[float] = []
         self._lock = threading.Lock()
 
     def update(self, outcome: str) -> None:
@@ -560,6 +568,23 @@ class SessionRiskTracker:
         with self._lock:
             self._risk_score = max(0.0, min(1.0, self._risk_score + delta))
             self._call_count += 1
+
+    def record_call(self) -> None:
+        """Record the wall-clock timestamp of this call for velocity tracking."""
+        now = time.time()
+        with self._lock:
+            self._call_timestamps.append(now)
+            # Prune timestamps older than 2× the window to bound memory usage.
+            cutoff = now - self.velocity_window_seconds * 2
+            self._call_timestamps = [t for t in self._call_timestamps if t >= cutoff]
+
+    def check_velocity(self) -> tuple[bool, int]:
+        """Return (is_anomalous, calls_in_window). Thread-safe snapshot."""
+        now = time.time()
+        cutoff = now - self.velocity_window_seconds
+        with self._lock:
+            recent = sum(1 for t in self._call_timestamps if t >= cutoff)
+        return recent >= self.velocity_max_calls, recent
 
     @property
     def risk_score(self) -> float:
@@ -705,6 +730,16 @@ class IntentLockPolicyHandler(InterventionHandler):
                     f"Deterministic denylist violation: '{found[:200]}' matches a prohibited destination.",
                 )
 
+        # Sensitive parameter guard — deterministic Confirm before model evaluation
+        if self.context.sensitive_parameters:
+            for key in tool_args:
+                if key in self.context.sensitive_parameters:
+                    return (
+                        "Confirm",
+                        f"Sensitive parameter '{key}' in '{tool_name}' requires explicit "
+                        "operator confirmation before the call may proceed.",
+                    )
+
         # RBAC
         if tool_name == "delete_resource" and "admin" not in self.context.operator_roles:
             return (
@@ -776,6 +811,44 @@ class IntentLockPolicyHandler(InterventionHandler):
             Deny(reason=f"Retry budget ({self.max_guide_retries}) exhausted for '{key}': {reason}"),
         )
 
+    def export_audit(self, fmt: str = "jsonl") -> str:
+        """
+        Export the audit log as JSONL (one JSON object per line) or CSV.
+
+        fmt='jsonl'  — newline-delimited JSON, ready for CloudWatch Logs / S3 ingestion
+        fmt='csv'    — comma-separated, ready for spreadsheet / pandas analysis
+
+        Both formats include all fields written to audit_log records.
+        """
+        if not self.audit_log:
+            return ""
+
+        if fmt == "jsonl":
+            return "\n".join(json.dumps(rec, ensure_ascii=False) for rec in self.audit_log)
+
+        if fmt == "csv":
+            import io, csv as _csv
+            all_keys: list[str] = []
+            seen: set[str] = set()
+            for rec in self.audit_log:
+                for k in rec:
+                    if k not in seen:
+                        all_keys.append(k)
+                        seen.add(k)
+            buf = io.StringIO()
+            writer = _csv.DictWriter(buf, fieldnames=all_keys, extrasaction="ignore")
+            writer.writeheader()
+            for rec in self.audit_log:
+                # Flatten list/dict values to JSON strings for CSV compatibility
+                flat = {
+                    k: json.dumps(v) if isinstance(v, (list, dict)) else v
+                    for k, v in rec.items()
+                }
+                writer.writerow(flat)
+            return buf.getvalue()
+
+        raise ValueError(f"Unsupported export format {fmt!r}; use 'jsonl' or 'csv'.")
+
     def _scan_untrusted_for_injection(self) -> list[str]:
         """
         Stage 0: scan untrusted_external_data for known prompt-injection phrases.
@@ -834,15 +907,24 @@ class IntentLockPolicyHandler(InterventionHandler):
         """
         Analyse the session audit log and classify detected threat patterns.
 
+        Detects both aggregate patterns (counts across all calls) and temporal
+        compound sequences (ordered multi-step attack chains).
+
         Returns a dict with:
-          threat_types     list[str]  — named patterns detected (may be empty)
-          highest_severity str        — 'critical' | 'elevated' | 'low' | 'none'
-          evidence         dict       — per-pattern counts that triggered classification
+          threat_types      list[str]  — named patterns detected (may be empty)
+          highest_severity  str        — 'critical' | 'elevated' | 'low' | 'none'
+          compound_patterns list[str]  — multi-step attack sequences detected
+          evidence          dict       — per-pattern counts that triggered classification
         """
         prov_counts: dict[str, int] = {}
         egress_counts: dict[str, int] = {}
         priv_counts: dict[str, int] = {}
         injection_signals = 0
+        velocity_anomalies = 0
+        max_threat_score: float = 0.0
+
+        # Ordered sequence of per-call signals for temporal analysis
+        call_sequence: list[dict[str, Any]] = []
 
         for rec in self.audit_log:
             prov = rec.get("provenance_choice")
@@ -856,7 +938,20 @@ class IntentLockPolicyHandler(InterventionHandler):
                 priv_counts[priv] = priv_counts.get(priv, 0) + 1
             if rec.get("injection_signal"):
                 injection_signals += 1
+            if rec.get("velocity_anomaly"):
+                velocity_anomalies += 1
+            ts = rec.get("composite_threat_score")
+            if isinstance(ts, (int, float)) and ts > max_threat_score:
+                max_threat_score = float(ts)
+            call_sequence.append({
+                "prov": prov,
+                "egress": egress,
+                "priv": priv,
+                "injection": bool(rec.get("injection_signal")),
+                "outcome": rec.get("outcome"),
+            })
 
+        # ── Aggregate single-dimension threats ─────────────────────────────
         threats: list[str] = []
 
         if prov_counts.get("untrusted_injection", 0) >= 1 or injection_signals >= 1:
@@ -877,29 +972,88 @@ class IntentLockPolicyHandler(InterventionHandler):
         if prov_counts.get("ungrounded_guess", 0) >= 2:
             threats.append("ungrounded_agent")
 
+        if velocity_anomalies >= 1:
+            threats.append("anomalous_call_velocity")
+
+        # ── Compound / temporal sequence detection ─────────────────────────
+        compound: list[str] = []
+
+        # APT sequence: injection probe → privilege escalation → exfiltration
+        # (all three must appear, in order, across the call sequence)
+        saw_injection_idx = next(
+            (i for i, c in enumerate(call_sequence)
+             if c["prov"] == "untrusted_injection" or c["injection"]),
+            None,
+        )
+        saw_priv_esc_idx = next(
+            (i for i, c in enumerate(call_sequence) if c["priv"] == "privilege_escalation"),
+            None,
+        )
+        saw_exfil_idx = next(
+            (i for i, c in enumerate(call_sequence) if c["egress"] == "unauthorized_egress"),
+            None,
+        )
+        if (
+            saw_injection_idx is not None
+            and saw_priv_esc_idx is not None
+            and saw_exfil_idx is not None
+            and saw_injection_idx < saw_priv_esc_idx < saw_exfil_idx
+        ):
+            compound.append("apt_sequence")
+
+        # Confirmed injection: both Stage 0 regex hit AND Decider flagged untrusted_injection
+        if injection_signals >= 1 and prov_counts.get("untrusted_injection", 0) >= 1:
+            compound.append("confirmed_injection_attack")
+
+        # Injection with exfiltration in the same session (even out of order)
+        if (prov_counts.get("untrusted_injection", 0) >= 1 or injection_signals >= 1) and \
+           egress_counts.get("unauthorized_egress", 0) >= 1:
+            if "apt_sequence" not in compound:
+                compound.append("injection_with_exfiltration")
+
+        # Escalation ladder: scope_expansion appears before privilege_escalation
+        scope_idx = next(
+            (i for i, c in enumerate(call_sequence) if c["priv"] == "scope_expansion"), None
+        )
+        esc_idx = next(
+            (i for i, c in enumerate(call_sequence) if c["priv"] == "privilege_escalation"), None
+        )
+        if scope_idx is not None and esc_idx is not None and scope_idx < esc_idx:
+            if "privilege_escalation_chain" in threats and "apt_sequence" not in compound:
+                compound.append("escalation_ladder")
+
+        # ── Severity mapping ────────────────────────────────────────────────
         severity_map = {
+            "apt_sequence": "critical",
+            "confirmed_injection_attack": "critical",
+            "injection_with_exfiltration": "critical",
+            "escalation_ladder": "critical",
             "prompt_injection_attempt": "critical",
             "data_exfiltration_attempt": "critical",
             "privilege_escalation_chain": "critical",
             "privilege_escalation_attempt": "elevated",
             "scope_creep": "elevated",
+            "anomalous_call_velocity": "elevated",
             "ungrounded_agent": "low",
         }
         severity_order = ["critical", "elevated", "low", "none"]
         highest = "none"
-        for t in threats:
+        for t in threats + compound:
             s = severity_map.get(t, "low")
             if severity_order.index(s) < severity_order.index(highest):
                 highest = s
 
         return {
             "threat_types": threats,
+            "compound_patterns": compound,
             "highest_severity": highest,
+            "max_composite_threat_score": round(max_threat_score, 4),
             "evidence": {
                 "provenance_counts": prov_counts,
                 "egress_counts": egress_counts,
                 "privilege_counts": priv_counts,
                 "injection_pre_scan_hits": injection_signals,
+                "velocity_anomaly_calls": velocity_anomalies,
             },
         }
 
@@ -970,6 +1124,56 @@ class IntentLockPolicyHandler(InterventionHandler):
             ],
         }
 
+    def _compute_threat_score(
+        self,
+        prov_choice: str | None,
+        prov_conf: float,
+        egress_choice: str | None,
+        egress_conf: float,
+        priv_choice: str | None,
+        priv_conf: float,
+        injection_signal: bool,
+    ) -> float:
+        """
+        Composite 0–1 threat score fusing all available signals for a single call.
+
+        Higher = more suspicious. Useful for trend charts and SIEM ingestion.
+        Components:
+          injection pre-scan   0.25  (binary)
+          provenance choice    0–0.30  (untrusted_injection → max)
+          confidence gap       0–0.15  (1 - min(prov_conf, egress_conf))
+          egress choice        0–0.30  (unauthorized_egress → max)
+          privilege choice     0–0.25  (privilege_escalation → max)
+          session risk bleed   0–0.15  (scaled session_risk_score)
+        """
+        score = 0.0
+
+        if injection_signal:
+            score += 0.25
+
+        if prov_choice == "untrusted_injection":
+            score += 0.30
+        elif prov_choice == "ungrounded_guess":
+            score += 0.10
+        else:
+            score += max(0.0, (1.0 - prov_conf) * 0.15)
+
+        if egress_choice == "unauthorized_egress":
+            score += 0.30
+        elif egress_choice == "ambiguous_scope":
+            score += 0.10
+        else:
+            score += max(0.0, (1.0 - egress_conf) * 0.10)
+
+        if priv_choice == "privilege_escalation":
+            score += 0.25
+        elif priv_choice == "scope_expansion":
+            score += 0.08
+
+        score += self.session_risk.risk_score * 0.15
+
+        return round(min(1.0, score), 4)
+
     def _synthesize_explanation(
         self,
         final_type: str,
@@ -1020,6 +1224,8 @@ class IntentLockPolicyHandler(InterventionHandler):
         self, tool_name: str, tool_args: dict[str, Any]
     ) -> tuple[str, Any, dict[str, Any]]:
         t_start = time.perf_counter()
+        velocity_anomaly: bool = False
+        calls_in_window: int = 0
 
         # ── SESSION LOCK CHECK ──────────────────────────────────────────────
         if self.session_risk.is_locked:
@@ -1046,6 +1252,8 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "state_tokens_est": 0,
                 "injection_signal": False,
                 "injection_hits": [],
+                "velocity_anomaly": velocity_anomaly,
+                "calls_in_window": calls_in_window,
                 "provenance_choice": None,
                 "provenance_conf": None,
                 "egress_choice": None,
@@ -1063,6 +1271,12 @@ class IntentLockPolicyHandler(InterventionHandler):
             self.audit_log.append(record)
             return final_type, action_obj, record
 
+        # ── VELOCITY TRACKING ──────────────────────────────────────────────
+        self.session_risk.record_call()
+        velocity_anomaly, calls_in_window = self.session_risk.check_velocity()
+        if velocity_anomaly:
+            self.session_risk.update("Confirm")  # anomalous rate is a weak risk signal
+
         # ── STAGE 0: Injection pre-scan ────────────────────────────────────
         injection_hits = self._scan_untrusted_for_injection()
         if injection_hits:
@@ -1078,6 +1292,8 @@ class IntentLockPolicyHandler(InterventionHandler):
                 final_type, action_obj = self._apply_bounded_guide(
                     f"stage1:{tool_name}", stage1_reason
                 )
+            elif stage1_outcome == "Confirm":
+                final_type, action_obj = "Confirm", Confirm(reason=stage1_reason)
             else:
                 final_type, action_obj = "Deny", Deny(reason=stage1_reason)
 
@@ -1096,12 +1312,15 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "state_tokens_est": 0,
                 "injection_signal": bool(injection_hits),
                 "injection_hits": injection_hits[:3],
+                "velocity_anomaly": velocity_anomaly,
+                "calls_in_window": calls_in_window,
                 "provenance_choice": None,
                 "provenance_conf": None,
                 "egress_choice": None,
                 "egress_conf": None,
                 "privilege_choice": None,
                 "privilege_conf": None,
+                "composite_threat_score": None,
                 "session_risk_score": round(self.session_risk.risk_score, 4),
                 "session_call_count": self.session_risk.call_count,
                 "outcome": final_type,
@@ -1142,12 +1361,15 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "state_tokens_est": max(1, len(envelope) // 4),
                 "injection_signal": bool(injection_hits),
                 "injection_hits": injection_hits[:3],
+                "velocity_anomaly": velocity_anomaly,
+                "calls_in_window": calls_in_window,
                 "provenance_choice": None,
                 "provenance_conf": None,
                 "egress_choice": None,
                 "egress_conf": None,
                 "privilege_choice": None,
                 "privilege_conf": None,
+                "composite_threat_score": None,
                 "session_risk_score": round(self.session_risk.risk_score, 4),
                 "session_call_count": self.session_risk.call_count,
                 "outcome": final_type,
@@ -1300,12 +1522,18 @@ class IntentLockPolicyHandler(InterventionHandler):
             "state_tokens_est": max(1, len(envelope) // 4),
             "injection_signal": bool(injection_hits),
             "injection_hits": injection_hits[:3],
+            "velocity_anomaly": velocity_anomaly,
+            "calls_in_window": calls_in_window,
             "provenance_choice": prov_choice,
             "provenance_conf": round(prov_conf, 4),
             "egress_choice": egress_choice,
             "egress_conf": round(egress_conf, 4),
             "privilege_choice": priv_choice,
             "privilege_conf": round(priv_conf, 4) if priv_choice else None,
+            "composite_threat_score": self._compute_threat_score(
+                prov_choice, prov_conf, egress_choice, egress_conf,
+                priv_choice, priv_conf, bool(injection_hits),
+            ),
             "session_risk_score": round(self.session_risk.risk_score, 4),
             "session_call_count": self.session_risk.call_count,
             "outcome": final_type,
