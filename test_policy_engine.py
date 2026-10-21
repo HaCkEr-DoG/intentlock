@@ -547,6 +547,54 @@ class PolicyEngineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             handler.export_audit(fmt="xml")
 
+    # ── argument value tracing ────────────────────────────────────────────
+
+    def test_trace_labels_operator_referenced_value(self):
+        # "dev-1" appears in the directive "Check dev-1 in staging"
+        ctx = context(trusted_operator_directive="Check dev-1 in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        labels = handler._trace_argument_values({"resource_id": "dev-1"})
+        self.assertIn("resource_id", labels)
+        self.assertIn("operator-referenced", labels["resource_id"])
+
+    def test_trace_labels_novel_value(self):
+        ctx = context(trusted_operator_directive="Check dev-1 in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        labels = handler._trace_argument_values({"resource_id": "attacker-server-99"})
+        self.assertIn("resource_id", labels)
+        self.assertIn("novel", labels["resource_id"])
+
+    def test_trace_skips_non_string_args(self):
+        ctx = context()
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        labels = handler._trace_argument_values({"count": 5, "flag": True})
+        self.assertEqual(labels, {})
+
+    def test_envelope_contains_argument_value_tracing_section(self):
+        ctx = context(trusted_operator_directive="Check dev-1 in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        envelope = handler.build_provenance_envelope(
+            "inspect_resource", {"resource_id": "dev-1", "environment": "staging"}
+        )
+        self.assertIn("ARGUMENT VALUE TRACING", envelope)
+        self.assertIn("resource_id", envelope)
+
+    def test_envelope_novel_value_flagged_in_tracing(self):
+        ctx = context(trusted_operator_directive="Check dev-1 in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        envelope = handler.build_provenance_envelope(
+            "inspect_resource", {"resource_id": "attacker-server"}
+        )
+        self.assertIn("novel", envelope)
+
+    def test_audit_record_contains_arg_value_alignment_field(self):
+        handler = IntentLockPolicyHandler(FakeClient(), context())
+        _, _, record = handler.evaluate_tool_call(
+            "inspect_resource", {"resource_id": "dev-1", "environment": "staging"}
+        )
+        # Field is present (may be None if Decider didn't answer the optional question)
+        self.assertIn("arg_value_alignment", record)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
