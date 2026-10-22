@@ -16,9 +16,11 @@ Production improvements (2026.10.2):
 from __future__ import annotations
 
 import hashlib
+import hmac as _hmac
 import json
 import math
 import re
+import secrets
 import threading
 import time
 import urllib.request
@@ -232,6 +234,50 @@ def compute_config_digest(config_payload: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool policy registry — declarative per-tool constraints consumed by Stage 1.
+# Add new tools here instead of editing _check_stage1_deterministic.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ToolPolicy:
+    """Declarative Stage-1 constraints for a single tool."""
+    requires_roles: frozenset[str] = field(default_factory=frozenset)
+    requires_environment: bool = False
+    requires_resource_id: bool = False
+    requires_dry_run: bool = False
+
+
+TOOL_REGISTRY: dict[str, ToolPolicy] = {
+    "inspect_resource": ToolPolicy(
+        requires_environment=True,
+        requires_resource_id=True,
+    ),
+    "dry_run_config": ToolPolicy(
+        requires_environment=True,
+        requires_resource_id=True,
+    ),
+    "apply_cloud_config": ToolPolicy(
+        requires_environment=True,
+        requires_resource_id=True,
+        requires_dry_run=True,
+    ),
+    "delete_resource": ToolPolicy(
+        requires_roles=frozenset({"admin"}),
+        requires_environment=True,
+        requires_resource_id=True,
+    ),
+    "set_key": ToolPolicy(
+        requires_environment=True,
+    ),
+    "export_diagnostic_bundle": ToolPolicy(
+        requires_resource_id=True,
+    ),
+    "update_iam_policy": ToolPolicy(
+        requires_roles=frozenset({"admin"}),
+    ),
+}
+
+# ---------------------------------------------------------------------------
 # Dry-run ledger — in-memory default; swappable for DynamoDB in production
 # ---------------------------------------------------------------------------
 
@@ -283,6 +329,153 @@ class InMemoryLedger(AbstractDryRunLedger):
             and r.environment == environment
             and r.resource_id == resource_id
         ]
+
+
+# ---------------------------------------------------------------------------
+# DynamoDB ledger — production backend; requires boto3
+# ---------------------------------------------------------------------------
+
+class DynamoDBLedger(AbstractDryRunLedger):
+    """
+    Production-grade dry-run ledger backed by DynamoDB.
+    Requires boto3 and a table with partition key 'pk' (String).
+    Enable TTL on the 'ttl' attribute in DynamoDB to auto-expire old records.
+
+    Usage:
+        ctx = ProvenanceContext(..., _ledger=DynamoDBLedger("intentlock-dryruns"))
+    """
+
+    def __init__(self, table_name: str, region: str = "us-east-1") -> None:
+        self._table_name = table_name
+        self._region = region
+        self._table = None
+
+    def _connect(self):
+        if self._table is None:
+            import boto3  # type: ignore[import]
+            self._table = boto3.resource("dynamodb", region_name=self._region).Table(
+                self._table_name
+            )
+        return self._table
+
+    def record(self, rec: DryRunRecord) -> None:
+        self._connect().put_item(
+            Item={
+                "pk": f"{rec.operator_id}:{rec.environment}:{rec.resource_id}:{rec.config_digest}",
+                "operator_id": rec.operator_id,
+                "environment": rec.environment,
+                "resource_id": rec.resource_id,
+                "config_digest": rec.config_digest,
+                "succeeded": rec.succeeded,
+                "recorded_at": str(rec.timestamp),
+                "ttl": int(rec.timestamp + 86400),  # 24h hard cap
+            }
+        )
+
+    def query(
+        self, operator_id: str, environment: str, resource_id: str
+    ) -> list[DryRunRecord]:
+        from boto3.dynamodb.conditions import Key  # type: ignore[import]
+        resp = self._connect().query(
+            KeyConditionExpression=Key("pk").begins_with(
+                f"{operator_id}:{environment}:{resource_id}:"
+            )
+        )
+        results = []
+        for item in resp.get("Items", []):
+            results.append(
+                DryRunRecord(
+                    operator_id=item["operator_id"],
+                    environment=item["environment"],
+                    resource_id=item["resource_id"],
+                    config_digest=item["config_digest"],
+                    succeeded=bool(item.get("succeeded", True)),
+                    timestamp=float(item.get("recorded_at", 0)),
+                )
+            )
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Audit sink — write every policy record to a durable backend
+# ---------------------------------------------------------------------------
+
+class AbstractAuditSink(ABC):
+    """Pluggable backend that receives every audit record as it is produced."""
+
+    @abstractmethod
+    def write(self, record: dict[str, Any]) -> None: ...
+
+
+class NullAuditSink(AbstractAuditSink):
+    """No-op sink — records stay only in the in-memory audit_log (default)."""
+
+    def write(self, record: dict[str, Any]) -> None:
+        pass
+
+
+class FileAuditSink(AbstractAuditSink):
+    """
+    Appends one JSON line per record to a local file.
+    Thread-safe; never blocks policy evaluation.
+
+    Usage:
+        handler = IntentLockPolicyHandler(
+            client=..., context=...,
+            audit_sink=FileAuditSink("/var/log/intentlock/audit.jsonl"),
+        )
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+
+    def write(self, record: dict[str, Any]) -> None:
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+
+
+class CloudWatchAuditSink(AbstractAuditSink):
+    """
+    Ships each record to a CloudWatch Logs stream.
+    Requires boto3 and IAM permission logs:PutLogEvents.
+    Never blocks policy evaluation — failures are silently swallowed.
+
+    Usage:
+        handler = IntentLockPolicyHandler(
+            client=..., context=...,
+            audit_sink=CloudWatchAuditSink(
+                log_group="/intentlock/prod",
+                log_stream="agent-session-001",
+            ),
+        )
+    """
+
+    def __init__(self, log_group: str, log_stream: str) -> None:
+        self._log_group = log_group
+        self._log_stream = log_stream
+        self._cw = None
+
+    def _client(self):
+        if self._cw is None:
+            import boto3  # type: ignore[import]
+            self._cw = boto3.client("logs")
+        return self._cw
+
+    def write(self, record: dict[str, Any]) -> None:
+        try:
+            self._client().put_log_events(
+                logGroupName=self._log_group,
+                logStreamName=self._log_stream,
+                logEvents=[{
+                    "timestamp": int(time.time() * 1000),
+                    "message": json.dumps(record, ensure_ascii=False),
+                }],
+            )
+        except Exception:
+            pass  # Never let sink failure propagate into policy evaluation
 
 
 # ---------------------------------------------------------------------------
@@ -477,12 +670,20 @@ class LocalDeciderClient:
         self,
         state: str,
         questions: dict[str, dict[str, Any]],
+        *,
+        stable_key: str | None = None,
     ) -> tuple[dict[str, Any], float, bool, bool]:
         """
         Returns (answers, latency_ms, was_cold_start, cache_hit).
         Raises DeciderUnavailableError when:
           - the server is unreachable
           - the circuit breaker is open
+
+        stable_key: when provided, used as the cache key instead of a hash of
+        the full envelope.  The envelope includes session history which changes
+        every call, driving cache hit rate to ~0%.  Pass a key derived from
+        (tool_name, args, directive_hash) to get semantic cache hits across
+        calls that differ only in session history.
         """
         with self._lock:
             now = time.time()
@@ -500,7 +701,7 @@ class LocalDeciderClient:
                     )
 
             # — Response cache check —
-            cache_key = self._cache_key(state, questions)
+            cache_key = stable_key if stable_key else self._cache_key(state, questions)
             if cache_key in self._cache:
                 cached_answers, cached_at = self._cache[cache_key]
                 if now - cached_at <= self.cache_ttl_seconds:
@@ -537,6 +738,78 @@ class LocalDeciderClient:
                     f"Decider server unreachable ({type(exc).__name__}: {exc}). "
                     f"Consecutive failures: {self._consecutive_failures}."
                 ) from exc
+
+
+# ---------------------------------------------------------------------------
+# DeciderPool — HA wrapper around multiple LocalDeciderClient instances
+# ---------------------------------------------------------------------------
+
+class DeciderPool:
+    """
+    Round-robin pool of LocalDeciderClient endpoints with automatic failover.
+    Eliminates the single-Decider-server SPOF: one open circuit skips to the
+    next healthy endpoint.
+
+    Usage:
+        pool = DeciderPool([
+            LocalDeciderClient("http://127.0.0.1:8099/v1/systemone"),
+            LocalDeciderClient("http://127.0.0.1:8100/v1/systemone"),
+        ])
+        handler = IntentLockPolicyHandler(client=pool, context=ctx)
+    """
+
+    def __init__(self, clients: list[LocalDeciderClient]) -> None:
+        if not clients:
+            raise ValueError("DeciderPool requires at least one client.")
+        self._clients = clients
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    # -- Duck-type compatibility with LocalDeciderClient --
+
+    @property
+    def checkpoint(self) -> str:
+        return self._clients[0].checkpoint
+
+    @property
+    def circuit_open(self) -> bool:
+        return all(c.circuit_open for c in self._clients)
+
+    @property
+    def consecutive_failures(self) -> int:
+        with self._lock:
+            return self._clients[self._idx % len(self._clients)].consecutive_failures
+
+    def evaluate(
+        self,
+        state: str,
+        questions: dict[str, dict[str, Any]],
+        *,
+        stable_key: str | None = None,
+    ) -> tuple[dict[str, Any], float, bool, bool]:
+        with self._lock:
+            start = self._idx
+            n = len(self._clients)
+
+        last_exc: Exception | None = None
+        for attempt in range(n):
+            idx = (start + attempt) % n
+            client = self._clients[idx]
+            if client.circuit_open:
+                continue
+            try:
+                result = client.evaluate(state, questions, stable_key=stable_key)
+                with self._lock:
+                    self._idx = (idx + 1) % n
+                return result
+            except DeciderUnavailableError as exc:
+                last_exc = exc
+                continue
+
+        raise DeciderUnavailableError(
+            f"All {len(self._clients)} DeciderPool endpoints unavailable."
+            + (f" Last error: {last_exc}" if last_exc else "")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +901,118 @@ class SessionRiskTracker:
         if self._risk_score >= self.risk_threshold:
             return min(base + 0.15, 0.95)
         return base
+
+
+# ---------------------------------------------------------------------------
+# Session store — distributed risk score + approved value pool
+# ---------------------------------------------------------------------------
+
+class AbstractSessionStore(ABC):
+    """
+    Pluggable backend for per-session state that must survive process restarts
+    or be shared across multiple handler instances serving the same session.
+
+    The default InMemorySessionStore is in-process only.
+    Use RedisSessionStore for multi-replica or Lambda deployments.
+    """
+
+    @abstractmethod
+    def get_risk_score(self, session_id: str) -> float: ...
+
+    @abstractmethod
+    def set_risk_score(self, session_id: str, score: float) -> None: ...
+
+    @abstractmethod
+    def get_value_pool(self, session_id: str) -> set[str]: ...
+
+    @abstractmethod
+    def add_to_value_pool(self, session_id: str, tokens: set[str]) -> None: ...
+
+
+class InMemorySessionStore(AbstractSessionStore):
+    """Default in-process store. Not shared across OS processes."""
+
+    def __init__(self) -> None:
+        self._risk: dict[str, float] = {}
+        self._pools: dict[str, set[str]] = {}
+        self._lock = threading.Lock()
+
+    def get_risk_score(self, session_id: str) -> float:
+        with self._lock:
+            return self._risk.get(session_id, 0.0)
+
+    def set_risk_score(self, session_id: str, score: float) -> None:
+        with self._lock:
+            self._risk[session_id] = score
+
+    def get_value_pool(self, session_id: str) -> set[str]:
+        with self._lock:
+            return set(self._pools.get(session_id, set()))
+
+    def add_to_value_pool(self, session_id: str, tokens: set[str]) -> None:
+        with self._lock:
+            if session_id not in self._pools:
+                self._pools[session_id] = set()
+            self._pools[session_id].update(tokens)
+
+
+class RedisSessionStore(AbstractSessionStore):
+    """
+    Production session store backed by Redis.
+    Requires redis-py: pip install redis
+
+    Usage:
+        store = RedisSessionStore(host="redis.internal", port=6379)
+        handler = IntentLockPolicyHandler(..., session_store=store, session_id="sess-001")
+    """
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 6379,
+        db: int = 0,
+        ttl_seconds: int = 3600,
+    ) -> None:
+        self._host = host
+        self._port = port
+        self._db = db
+        self._ttl = ttl_seconds
+        self._client = None
+
+    def _r(self):
+        if self._client is None:
+            import redis  # type: ignore[import]
+            self._client = redis.Redis(host=self._host, port=self._port, db=self._db)
+        return self._client
+
+    def get_risk_score(self, session_id: str) -> float:
+        try:
+            val = self._r().get(f"intentlock:risk:{session_id}")
+            return float(val) if val is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def set_risk_score(self, session_id: str, score: float) -> None:
+        try:
+            self._r().setex(f"intentlock:risk:{session_id}", self._ttl, str(score))
+        except Exception:
+            pass
+
+    def get_value_pool(self, session_id: str) -> set[str]:
+        try:
+            members = self._r().smembers(f"intentlock:pool:{session_id}")
+            return {m.decode("utf-8") for m in members}
+        except Exception:
+            return set()
+
+    def add_to_value_pool(self, session_id: str, tokens: set[str]) -> None:
+        try:
+            r = self._r()
+            if tokens:
+                r.sadd(f"intentlock:pool:{session_id}", *tokens)
+                r.expire(f"intentlock:pool:{session_id}", self._ttl)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -962,13 +1347,16 @@ class IntentLockPolicyHandler(InterventionHandler):
 
     def __init__(
         self,
-        client: LocalDeciderClient,
+        client: "LocalDeciderClient | DeciderPool",
         context: ProvenanceContext,
         confidence_threshold: float = 0.70,
         max_guide_retries: int = 1,
         fail_open: bool = False,
         risk_threshold: float = 0.45,
         lockout_threshold: float = 0.75,
+        audit_sink: AbstractAuditSink | None = None,
+        session_store: AbstractSessionStore | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.client = client
         self.context = context
@@ -981,6 +1369,14 @@ class IntentLockPolicyHandler(InterventionHandler):
         )
         self._retry_counts: dict[str, int] = {}
         self.audit_log: list[dict[str, Any]] = []
+        # Pluggable durable sink — NullAuditSink by default (in-memory log only)
+        self._audit_sink: AbstractAuditSink = audit_sink or NullAuditSink()
+        # Pluggable session store — InMemory by default
+        self._session_store: AbstractSessionStore = session_store or InMemorySessionStore()
+        self._session_id: str = session_id or secrets.token_hex(8)
+        # Per-session HMAC key — proves each audit record matches the envelope
+        # that was actually evaluated (tamper evidence for distributed deployments)
+        self._session_key: bytes = secrets.token_bytes(32)
         # Compact log of prior tool calls included in each envelope so Decider
         # can reason about trajectory, not just the current call in isolation.
         self._session_ops: list[dict[str, Any]] = []
@@ -994,6 +1390,25 @@ class IntentLockPolicyHandler(InterventionHandler):
         # by Stage 0.  Prevents a static benign log entry from adding +0.12 risk
         # on every subsequent tool call.
         self._injection_seen: set[tuple[str, int]] = set()
+
+    def _stable_cache_key(self, tool_name: str, tool_args: dict[str, Any]) -> str:
+        """
+        Cache key that ignores session history so cache hits survive across calls
+        that differ only in their [SESSION HISTORY] envelope section.
+        Keyed on: tool_name + sorted args + first-16-hex of directive SHA-256.
+        """
+        directive_hash = hashlib.sha256(
+            self.context.trusted_operator_directive.encode("utf-8")
+        ).hexdigest()[:16]
+        payload = json.dumps(
+            {"tool": tool_name, "args": tool_args, "dir": directive_hash},
+            sort_keys=True, ensure_ascii=False,
+        )
+        return "sk:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    def _sign_envelope(self, envelope: str) -> str:
+        """HMAC-SHA256 of the envelope with the per-session key (first 16 hex chars)."""
+        return _hmac.new(self._session_key, envelope.encode("utf-8"), "sha256").hexdigest()[:16]
 
     def before_invocation(self, event: BeforeInvocationEvent, **kwargs: Any):
         self._retry_counts.clear()
@@ -1192,17 +1607,20 @@ class IntentLockPolicyHandler(InterventionHandler):
     def _check_stage1_deterministic(
         self, tool_name: str, tool_args: dict[str, Any]
     ) -> tuple[str | None, str]:
-        """Deterministic fast-fail. Returns (outcome, reason) or (None, "PASS")."""
+        """Deterministic fast-fail driven by TOOL_REGISTRY. Returns (outcome, reason) or (None, 'PASS')."""
         if not isinstance(tool_args, dict):
             return "Deny", "Malformed tool arguments: expected a dictionary."
 
-        # Recursive denylist scan — checks both keys and values, catches nested destinations
-        for key, val in tool_args.items():
-            found = self._scan_for_denylist(key) or self._scan_for_denylist(val)
-            if found is not None:
+        policy = TOOL_REGISTRY.get(tool_name)
+
+        # Recursive denylist scan — serialize to JSON and scan the full string so
+        # deeply-nested destinations (depth > 6) are not missed.
+        serialized_args = json.dumps(tool_args, ensure_ascii=False)
+        for bad in self.context.denylisted_destinations:
+            if bad.casefold() in serialized_args.casefold():
                 return (
                     "Deny",
-                    f"Deterministic denylist violation: '{found[:200]}' matches a prohibited destination.",
+                    f"Deterministic denylist violation: '{bad[:200]}' matches a prohibited destination.",
                 )
 
         # Sensitive parameter guard — deterministic Confirm before model evaluation
@@ -1215,27 +1633,24 @@ class IntentLockPolicyHandler(InterventionHandler):
                         "operator confirmation before the call may proceed.",
                     )
 
-        # RBAC
-        if tool_name == "delete_resource" and "admin" not in self.context.operator_roles:
-            return (
-                "Deny",
-                f"Deterministic RBAC: operator '{self.context.operator_id}' "
-                "lacks 'admin' role required for 'delete_resource'.",
-            )
+        # RBAC — driven by registry; unknown tools skip this check
+        if policy and policy.requires_roles:
+            missing = policy.requires_roles - self.context.operator_roles
+            if missing:
+                return (
+                    "Deny",
+                    f"Deterministic RBAC: operator '{self.context.operator_id}' "
+                    f"lacks role(s) {sorted(missing)} required for '{tool_name}'.",
+                )
 
         # Environment allowlist
-        environment_scoped_tools = {
-            "inspect_resource", "dry_run_config", "apply_cloud_config",
-            "delete_resource", "set_key",
-        }
         env_keys = [k for k in ("environment", "env") if k in tool_args]
         if len(env_keys) == 2 and tool_args["environment"] != tool_args["env"]:
             return "Deny", "Conflicting 'environment' and 'env' arguments."
         env_value = tool_args.get("environment", tool_args.get("env"))
-        if tool_name in environment_scoped_tools and (
-            not isinstance(env_value, str) or not env_value.strip()
-        ):
-            return "Deny", f"Environment is required for '{tool_name}'."
+        if policy and policy.requires_environment:
+            if not isinstance(env_value, str) or not env_value.strip():
+                return "Deny", f"Environment is required for '{tool_name}'."
         if env_value is not None:
             if not isinstance(env_value, str) or env_value not in self.context.allowed_environments:
                 return (
@@ -1247,14 +1662,9 @@ class IntentLockPolicyHandler(InterventionHandler):
 
         # Ownership — fail-closed: empty registry is not blanket permission
         resource_id = tool_args.get("resource_id")
-        resource_scoped_tools = {
-            "inspect_resource", "dry_run_config", "apply_cloud_config",
-            "delete_resource", "export_diagnostic_bundle",
-        }
-        if tool_name in resource_scoped_tools and (
-            not isinstance(resource_id, str) or not resource_id.strip()
-        ):
-            return "Deny", f"Non-empty resource_id required for '{tool_name}'."
+        if policy and policy.requires_resource_id:
+            if not isinstance(resource_id, str) or not resource_id.strip():
+                return "Deny", f"Non-empty resource_id required for '{tool_name}'."
         if resource_id is not None:
             if not isinstance(resource_id, str) or not resource_id.strip():
                 return "Deny", "Malformed or empty resource_id."
@@ -1265,11 +1675,11 @@ class IntentLockPolicyHandler(InterventionHandler):
                     f"{sorted(self.context.owned_resources)} for operator '{self.context.operator_id}'.",
                 )
 
-        # Dry-run prerequisite for apply
-        if tool_name == "apply_cloud_config":
+        # Dry-run prerequisite — driven by registry
+        if policy and policy.requires_dry_run:
             cfg = tool_args.get("config")
             if not isinstance(cfg, dict):
-                return "Deny", "Invalid or missing 'config' object in apply_cloud_config."
+                return "Deny", f"Invalid or missing 'config' object in '{tool_name}'."
             ok, msg = self.context.verify_dry_run_prerequisite(env_value, resource_id, cfg)
             if not ok:
                 return "Guide", f"Prerequisite failed: {msg}"
@@ -1744,6 +2154,7 @@ class IntentLockPolicyHandler(InterventionHandler):
             self.session_risk.update(final_type)
             record: dict[str, Any] = {
                 "policy_version": POLICY_VERSION,
+                "session_id": self._session_id,
                 "checkpoint": self.client.checkpoint,
                 "tool": tool_name,
                 "stage_resolved": "Session Lock",
@@ -1771,8 +2182,10 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "explanation": f"Session locked after {self.session_risk.call_count} calls with cumulative risk {self.session_risk.risk_score:.2f}.",
                 "remediation": "Terminate this agent session and start a new one with a clean operator directive.",
                 "latency_ms": round(total_ms, 3),
+                "envelope_hmac": None,
             }
             self.audit_log.append(record)
+            self._audit_sink.write(record)
             return final_type, action_obj, record
 
         # ── VELOCITY TRACKING ──────────────────────────────────────────────
@@ -1804,6 +2217,7 @@ class IntentLockPolicyHandler(InterventionHandler):
             self.session_risk.update(final_type)
             record: dict[str, Any] = {
                 "policy_version": POLICY_VERSION,
+                "session_id": self._session_id,
                 "checkpoint": self.client.checkpoint,
                 "tool": tool_name,
                 "stage_resolved": "Stage 1 (Deterministic)",
@@ -1832,15 +2246,19 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "explanation": self._synthesize_explanation(final_type, None, None, None, stage1_reason),
                 "remediation": self._remediation_hint(final_type, None, None, None),
                 "latency_ms": round(total_ms, 3),
+                "envelope_hmac": None,
             }
             self.audit_log.append(record)
+            self._audit_sink.write(record)
             return final_type, action_obj, record
 
         # ── STAGE 2: Strands Decider 2B ────────────────────────────────────
         envelope = self.build_provenance_envelope(tool_name, tool_args)
+        envelope_hmac = self._sign_envelope(envelope)
         try:
             answers, decider_ms, was_cold, cache_hit = self.client.evaluate(
-                envelope, INTENTLOCK_QUESTIONS
+                envelope, INTENTLOCK_QUESTIONS,
+                stable_key=self._stable_cache_key(tool_name, tool_args),
             )
         except DeciderUnavailableError as exc:
             total_ms = (time.perf_counter() - t_start) * 1000.0
@@ -1853,6 +2271,7 @@ class IntentLockPolicyHandler(InterventionHandler):
             self.session_risk.update(final_type)
             record = {
                 "policy_version": POLICY_VERSION,
+                "session_id": self._session_id,
                 "checkpoint": self.client.checkpoint,
                 "tool": tool_name,
                 "stage_resolved": "Stage 2 (Decider Unavailable)",
@@ -1881,8 +2300,10 @@ class IntentLockPolicyHandler(InterventionHandler):
                 "explanation": "Decider 2B server was unreachable; applied fail-closed policy.",
                 "remediation": "Bring the Decider server back online; do not switch to fail-open in production.",
                 "latency_ms": round(total_ms, 3),
+                "envelope_hmac": envelope_hmac,
             }
             self.audit_log.append(record)
+            self._audit_sink.write(record)
             return final_type, action_obj, record
 
         # ── STAGE 3: Most-restrictive-wins mapping ──────────────────────────
@@ -2072,6 +2493,7 @@ class IntentLockPolicyHandler(InterventionHandler):
         self.session_risk.update(final_type)
         record = {
             "policy_version": POLICY_VERSION,
+            "session_id": self._session_id,
             "checkpoint": self.client.checkpoint,
             "tool": tool_name,
             "stage_resolved": "Stage 2 (Decider 2B)" + (" [cache]" if cache_hit else ""),
@@ -2111,8 +2533,10 @@ class IntentLockPolicyHandler(InterventionHandler):
             ),
             "remediation": self._remediation_hint(final_type, prov_choice, egress_choice, priv_choice),
             "latency_ms": round(decider_ms, 2),
+            "envelope_hmac": envelope_hmac,
         }
         self.audit_log.append(record)
+        self._audit_sink.write(record)
         # Update approved value pool BEFORE session_ops so downstream calls in
         # the same turn can immediately treat these values as session-derived.
         self._update_approved_value_pool(tool_args, final_type)

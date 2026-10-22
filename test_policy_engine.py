@@ -33,7 +33,7 @@ class FakeClient:
         self.privilege = privilege
         self.confidence = confidence
 
-    def evaluate(self, state, questions):
+    def evaluate(self, state, questions, *, stable_key=None):
         self.calls += 1
         prov_keys = list(INTENTLOCK_QUESTIONS["provenance_verdict"]["criteria"])
         egress_keys = list(INTENTLOCK_QUESTIONS["data_egress_policy"]["criteria"])
@@ -57,7 +57,7 @@ class ErrorClient:
     circuit_open = False
     consecutive_failures = 0
 
-    def evaluate(self, state, questions):
+    def evaluate(self, state, questions, *, stable_key=None):
         raise DeciderUnavailableError("test server down")
 
 
