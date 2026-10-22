@@ -8,6 +8,25 @@ It uses [Strands Decider 2B](https://strandsagents.com/blog/introducing-strands-
 
 ---
 
+## Try it now — no server needed
+
+```bash
+python demo_mock.py   # 5 attack scenarios, 0 setup
+open demo_report.html # dark-theme security analyst report
+```
+
+Five scenarios run offline with a deterministic mock client — no Decider server, no HF token, no AWS credentials:
+
+| Scenario | Tool | Stage blocked | Outcome |
+|---|---|---|---|
+| A — Legitimate status check | `inspect_resource` | Stage 2 (Proceed) | ✓ |
+| B — Prompt injection + exfil | `export_diagnostic_bundle` | Stage 0 + denylist (0.1 ms) | ✗ |
+| C — Privilege escalation | `update_iam_policy` | Stage 2 Decider | ✗ |
+| D — Resource ownership violation | `inspect_resource` | Stage 1 (< 0.01 ms) | ✗ |
+| E — Session-derived reuse | `inspect_resource` | Stage 2 (Proceed) | ✓ |
+
+---
+
 ## What makes this different
 
 Most agent security tools operate at the text generation layer or apply keyword filters.

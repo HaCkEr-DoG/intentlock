@@ -300,9 +300,31 @@ SCENARIOS = [
 ]
 
 
+_C = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "red": "\033[91m",
+    "green": "\033[92m",
+    "yellow": "\033[93m",
+    "orange": "\033[38;5;208m",
+    "blue": "\033[94m",
+    "grey": "\033[90m",
+    "white": "\033[97m",
+    "bg_red": "\033[41m",
+    "bg_green": "\033[42m",
+}
+
+def _color(text: str, *codes: str) -> str:
+    prefix = "".join(_C.get(c, "") for c in codes)
+    return f"{prefix}{text}{_C['reset']}" if prefix else text
+
 def run_demo() -> None:
-    print(f"\nIntentLock {POLICY_VERSION} — Offline Mock Demo")
-    print("=" * 60)
+    print()
+    print(_color("╔══════════════════════════════════════════════════════════╗", "blue"))
+    print(_color("║", "blue") + _color(f"  IntentLock {POLICY_VERSION} — Offline Security Demo", "bold", "white") + _color("               ║", "blue"))
+    print(_color("║", "blue") + _color("  Prompt injection defense at the tool-call layer", "grey") + _color("          ║", "blue"))
+    print(_color("╚══════════════════════════════════════════════════════════╝", "blue"))
+    print()
 
     # Build per-scenario handlers
     handlers: list[IntentLockPolicyHandler] = []
@@ -329,14 +351,35 @@ def run_demo() -> None:
         stage0 = record.get("injection_hits") or []
         reason = record.get("reason") or ""
 
-        marker = {"Proceed": "✓", "Confirm": "?", "Guide": "~", "Deny": "✗"}.get(outcome, "·")
-        print(f"\n  {marker} {sc['name']}")
-        print(f"    Tool:    {sc['tool']}({json.dumps(sc['args'])})")
-        print(f"    Outcome: {outcome}  (threat={threat:.3f}, {latency:.1f} ms)")
+        outcome_style = {
+            "Proceed": ("✓", "green", "bold"),
+            "Confirm": ("?", "yellow", "bold"),
+            "Guide":   ("~", "orange"),
+            "Deny":    ("✗", "red", "bold"),
+        }.get(outcome, ("·", "grey"))
+        marker_char = outcome_style[0]
+        marker_colors = outcome_style[1:]
+
+        threat_bar_len = int(threat * 20)
+        threat_color = "red" if threat >= 0.5 else "orange" if threat >= 0.25 else "green"
+        threat_bar = _color("█" * threat_bar_len, threat_color) + _color("░" * (20 - threat_bar_len), "grey")
+
+        print(_color(f"  ┌─ Scenario {i}: {sc['name']}", "blue"))
+        print(f"  │  {_color(sc['description'][:80], 'grey')}")
+        print(f"  │")
+        args_str = json.dumps(sc['args'])
+        if len(args_str) > 60:
+            args_str = args_str[:57] + "…}"
+        print(f"  │  {_color('Tool:', 'grey')} {_color(sc['tool'], 'white')}({_color(args_str, 'grey')})")
+        outcome_badge = _color(f" {outcome} ", *marker_colors)
+        print(f"  │  {_color('Decision:', 'grey')} {outcome_badge}  {threat_bar} {_color(f'{threat:.3f}', threat_color)}  {_color(f'{latency:.1f} ms', 'grey')}")
+
         if stage0:
-            print(f"    Stage-0: {stage0[:2]}")
+            hit_text = str(stage0[0])[:72] + "…" if len(str(stage0[0])) > 72 else str(stage0[0])
+            print(f"  │  {_color('Stage-0 hit:', 'red')} {_color(hit_text, 'grey')}")
         if reason:
-            print(f"    Reason:  {reason[:80]}")
+            print(f"  │  {_color('Reason:', 'grey')} {_color(reason[:80], 'white')}")
+        print(_color(f"  └─ {marker_char}", *marker_colors))
 
     # Collect all audit records across handlers
     all_records: list[dict] = []
@@ -353,19 +396,25 @@ def run_demo() -> None:
     out = Path("demo_report.html")
     out.write_text(html, encoding="utf-8")
 
-    print(f"\n{'=' * 60}")
-    print(f"HTML report written to: {out.resolve()}")
-    print("Open it in a browser to see the full security analyst view.\n")
+    print()
+    print(_color("─" * 62, "blue"))
+    print(f"  {_color('HTML report:', 'grey')} {_color(str(out.resolve()), 'white')}")
+    print(f"  {_color('Open it:', 'grey')} {_color('open demo_report.html', 'blue')}")
+    print(_color("─" * 62, "blue"))
 
     # Summary
-    counts = {"Proceed": 0, "Confirm": 0, "Guide": 0, "Deny": 0}
+    counts: dict[str, int] = {"Proceed": 0, "Confirm": 0, "Guide": 0, "Deny": 0}
     for r in all_records:
         o = r.get("outcome", "")
         if o in counts:
             counts[o] += 1
-    print(f"Summary: {counts['Proceed']} Proceed · {counts['Confirm']} Confirm · "
-          f"{counts['Guide']} Guide · {counts['Deny']} Deny")
-    print(f"         {counts['Deny'] + counts['Guide']} attack/anomaly calls intercepted\n")
+
+    intercepted = counts["Deny"] + counts["Guide"] + counts["Confirm"]
+    print(f"\n  {_color('Proceed:', 'green', 'bold')} {counts['Proceed']}  "
+          f"{_color('Confirm:', 'yellow', 'bold')} {counts['Confirm']}  "
+          f"{_color('Guide:', 'orange')} {counts['Guide']}  "
+          f"{_color('Deny:', 'red', 'bold')} {counts['Deny']}")
+    print(f"  {_color(f'{intercepted} calls intercepted before execution', 'bold', 'white')}\n")
 
 
 if __name__ == "__main__":

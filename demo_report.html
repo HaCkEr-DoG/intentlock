@@ -27,7 +27,7 @@
     <div style="color:#475569;font-size:12px;margin-top:4px">
       Operator: <span style="color:#94a3b8">ops-team</span>
       &nbsp;·&nbsp; Policy version: <span style="color:#94a3b8">2026.10.10</span>
-      &nbsp;·&nbsp; Generated: <span style="color:#94a3b8">2026-10-22 06:11 UTC</span>
+      &nbsp;·&nbsp; Generated: <span style="color:#94a3b8">2026-10-22 08:29 UTC</span>
     </div>
   </div>
   <div style="text-align:right">
@@ -71,6 +71,19 @@
 <tr style='background:#0f172a'><td style='padding:8px 12px;color:#64748b;font-family:monospace'>7</td><td style='padding:8px 12px;color:#e2e8f0;font-family:monospace'>inspect_resource</td><td style='padding:8px 12px'><span style='background:#22c55e22;color:#22c55e;border:1px solid #22c55e44;border-radius:4px;padding:2px 7px;font-size:11px;font-family:monospace;white-space:nowrap'>Proceed</span></td><td style='padding:8px 12px'><div style='display:flex;align-items:center;gap:6px'><div style='width:80px;height:8px;background:#1e293b;border-radius:4px'><div style='width:1px;max-width:80px;height:8px;background:#22c55e;border-radius:4px'></div></div><span style='color:#22c55e;font-size:11px;font-family:monospace'>0.015</span></div></td><td style='padding:8px 12px;color:#94a3b8;font-size:12px;font-family:monospace'>trusted_operator</td><td style='padding:8px 12px;color:#94a3b8;font-size:12px;font-family:monospace'>internal_scoped</td><td style='padding:8px 12px;color:#94a3b8;font-size:12px'>—</td><td style='padding:8px 12px;color:#64748b;font-size:11px'>1 ms</td><td style='padding:8px 12px;color:#94a3b8;font-size:12px'>Permitted: provenance=trusted_operator@0.95, egress=internal_scoped@0.92, privil…<details style='margin-top:6px'><summary style='color:#64748b;cursor:pointer;font-size:11px'>details</summary><table style='margin-top:4px;border-collapse:collapse'><tr><td style='color:#94a3b8;padding:2px 8px'>Explanation</td><td style='color:#cbd5e1'>All three policy dimensions cleared: trusted source, internal scope, authorized privilege.</td></tr></table></details></td></tr>
   </tbody>
 </table>
+</div>
+
+
+<h2>Threat score trajectory</h2>
+<div style="border:1px solid #1e293b;border-radius:8px;padding:12px;background:#0a1628">
+<svg viewBox="0 0 600 80" xmlns="http://www.w3.org/2000/svg"
+  style="width:100%;max-width:600px;display:block">
+  <rect x="32" y="12" width="536.0" height="0.0" fill="#ef444408" />
+  <line x1="32" y1="35.4" x2="568" y2="35.4" stroke="#eab308" stroke-width="0.5" stroke-dasharray="3 4" opacity="0.4"/><text x="28" y="38.4" text-anchor="end" font-size="7" fill="#eab308" opacity="0.6">MED</text>
+  <polyline points="32.0,66.0 121.3,66.0 210.7,68.0 300.0,12.0 389.3,68.0 478.7,66.0 568.0,66.0" fill="none" stroke="#475569" stroke-width="1.5" opacity="0.4"/>
+  <circle cx="32.0" cy="66.0" r="5" fill="#22c55e" stroke="#020617" stroke-width="1.5"><title>inspect_resource: Proceed (threat=0.015)</title></circle><circle cx="121.3" cy="66.0" r="5" fill="#22c55e" stroke="#020617" stroke-width="1.5"><title>inspect_resource: Proceed (threat=0.015)</title></circle><circle cx="210.7" cy="68.0" r="5" fill="#ef4444" stroke="#020617" stroke-width="1.5"><title>export_diagnostic_bundle: Deny (threat=0.000)</title></circle><circle cx="300.0" cy="12.0" r="5" fill="#ef4444" stroke="#020617" stroke-width="1.5"><title>update_iam_policy: Deny (threat=0.430)</title></circle><circle cx="389.3" cy="68.0" r="5" fill="#ef4444" stroke="#020617" stroke-width="1.5"><title>inspect_resource: Deny (threat=0.000)</title></circle><circle cx="478.7" cy="66.0" r="5" fill="#22c55e" stroke="#020617" stroke-width="1.5"><title>inspect_resource: Proceed (threat=0.015)</title></circle><circle cx="568.0" cy="66.0" r="5" fill="#22c55e" stroke="#020617" stroke-width="1.5"><title>inspect_resource: Proceed (threat=0.015)</title></circle>
+  <text x="32.0" y="79" text-anchor="middle" font-size="7" fill="#475569">inspect_…</text><text x="121.3" y="79" text-anchor="middle" font-size="7" fill="#475569">inspect_…</text><text x="210.7" y="79" text-anchor="middle" font-size="7" fill="#475569">export_d…</text><text x="300.0" y="79" text-anchor="middle" font-size="7" fill="#475569">update_i…</text><text x="389.3" y="79" text-anchor="middle" font-size="7" fill="#475569">inspect_…</text><text x="478.7" y="79" text-anchor="middle" font-size="7" fill="#475569">inspect_…</text><text x="568.0" y="79" text-anchor="middle" font-size="7" fill="#475569">inspect_…</text>
+</svg>
 </div>
 
 <div style="margin-top:32px;padding-top:20px;border-top:1px solid #1e293b;

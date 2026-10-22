@@ -634,6 +634,90 @@ class SessionRiskTracker:
 # HTML audit report renderer
 # ---------------------------------------------------------------------------
 
+def _build_threat_chart(audit_log: list[dict[str, Any]]) -> str:
+    """Inline SVG sparkline showing threat score trajectory across the session."""
+    if not audit_log:
+        return ""
+
+    scores = [rec.get("composite_threat_score") or 0.0 for rec in audit_log]
+    outcomes = [rec.get("outcome") or "" for rec in audit_log]
+    tools = [rec.get("tool") or rec.get("tool_name") or "?" for rec in audit_log]
+
+    W, H = 600, 80
+    pad_x, pad_y = 32, 12
+    n = len(scores)
+    max_s = max(scores) if max(scores) > 0 else 1.0
+
+    def ox(i: int) -> float:
+        if n == 1:
+            return pad_x + (W - 2 * pad_x) / 2
+        return pad_x + i * (W - 2 * pad_x) / (n - 1)
+
+    def oy(s: float) -> float:
+        return pad_y + (1 - s / max_s) * (H - 2 * pad_y)
+
+    # Build polyline points
+    pts = " ".join(f"{ox(i):.1f},{oy(s):.1f}" for i, s in enumerate(scores))
+
+    # Danger zone (threat > 0.5) fill — red band at top
+    danger_y = oy(0.5) if max_s >= 0.5 else pad_y
+    danger_rect = (
+        f'<rect x="{pad_x}" y="{pad_y}" width="{W - 2*pad_x:.1f}" '
+        f'height="{max(0, danger_y - pad_y):.1f}" '
+        f'fill="#ef444408" />'
+    )
+
+    outcome_color = {
+        "Proceed": "#22c55e", "Confirm": "#eab308",
+        "Guide": "#f97316", "Deny": "#ef4444",
+    }
+
+    # Dots per call
+    dots = ""
+    for i, (s, o, t) in enumerate(zip(scores, outcomes, tools)):
+        cx, cy = ox(i), oy(s)
+        col = outcome_color.get(o, "#94a3b8")
+        dots += (
+            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="5" fill="{col}" '
+            f'stroke="#020617" stroke-width="1.5">'
+            f'<title>{t}: {o} (threat={s:.3f})</title></circle>'
+        )
+
+    # Reference lines
+    ref_lines = ""
+    for threshold, label, color in ((0.75, "CRIT", "#ef4444"), (0.50, "HIGH", "#f97316"), (0.25, "MED", "#eab308")):
+        if threshold <= max_s * 1.05:
+            ry = oy(threshold)
+            ref_lines += (
+                f'<line x1="{pad_x}" y1="{ry:.1f}" x2="{W - pad_x}" y2="{ry:.1f}" '
+                f'stroke="{color}" stroke-width="0.5" stroke-dasharray="3 4" opacity="0.4"/>'
+                f'<text x="{pad_x - 4}" y="{ry + 3:.1f}" text-anchor="end" '
+                f'font-size="7" fill="{color}" opacity="0.6">{label}</text>'
+            )
+
+    # X-axis labels
+    x_labels = ""
+    for i, t in enumerate(tools):
+        lbl = t[:8] + "…" if len(t) > 9 else t
+        x_labels += (
+            f'<text x="{ox(i):.1f}" y="{H - 1}" text-anchor="middle" '
+            f'font-size="7" fill="#475569">{lbl}</text>'
+        )
+
+    return f"""
+<h2>Threat score trajectory</h2>
+<div style="border:1px solid #1e293b;border-radius:8px;padding:12px;background:#0a1628">
+<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg"
+  style="width:100%;max-width:{W}px;display:block">
+  {danger_rect}
+  {ref_lines}
+  <polyline points="{pts}" fill="none" stroke="#475569" stroke-width="1.5" opacity="0.4"/>
+  {dots}
+  {x_labels}
+</svg>
+</div>"""
+
+
 def _render_html_report(
     audit_log: list[dict[str, Any]],
     context: "ProvenanceContext",
@@ -847,6 +931,8 @@ def _render_html_report(
   </tbody>
 </table>
 </div>
+
+{_build_threat_chart(audit_log)}
 
 <div style="margin-top:32px;padding-top:20px;border-top:1px solid #1e293b;
   color:#334155;font-size:11px">
