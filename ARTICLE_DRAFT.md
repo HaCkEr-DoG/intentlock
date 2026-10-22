@@ -43,9 +43,10 @@ Known injection phrases in untrusted data — `SYSTEM:`, `Ignore previous instru
 
 ### Stage 1: Deterministic fast-fail (< 0.1 ms)
 
-Hard rules with no model inference:
+Hard rules with no model inference, driven by a declarative `TOOL_REGISTRY`:
 
-- **Explicit denylist** — `s3://attacker-bucket` and similar patterns in destination args
+- **Explicit denylist** — scans JSON-serialized args for banned patterns (no depth limit)
+- **RBAC** — `delete_resource` requires `admin` role; checked before anything else
 - **Resource ownership** — fail-closed: the empty set means deny-all, not allow-all
 - **Environment allowlist** — staging-only operators cannot touch prod
 - **Dry-run prerequisite** — `apply_cloud_config` is blocked unless a matching `dry_run_config` with the same SHA-256 digest was recorded within the TTL
@@ -81,7 +82,7 @@ all four clear  +  all confidence ≥ 0.70                                 →  
 
 ---
 
-## Three innovations that made this work
+## Four innovations that made this work
 
 ### 1. Three-tier value provenance
 
@@ -102,6 +103,28 @@ IntentLock reads the raw probability distribution from Decider, not just the arg
 ### 3. Session trajectory context
 
 Every Decider envelope includes a compact log of the last 5 tool outcomes (name, outcome, provenance verdict, egress verdict). This lets the model detect multi-step attack patterns — read-then-exfil, incremental scope creep, APT-style decomposed attacks — that look innocent call by call.
+
+### 4. Declarative tool policy registry
+
+Rather than hardcoded `if tool_name == "apply_cloud_config"` chains in Stage 1, every tool's requirements are declared in a `TOOL_REGISTRY`:
+
+```python
+TOOL_REGISTRY = {
+    "apply_cloud_config": ToolPolicy(
+        requires_environment=True,
+        requires_resource_id=True,
+        requires_dry_run=True,   # blocked unless matching dry_run_config exists
+    ),
+    "delete_resource": ToolPolicy(
+        requires_roles=frozenset({"admin"}),
+        requires_environment=True,
+        requires_resource_id=True,
+    ),
+    # ...
+}
+```
+
+Adding a new tool to the policy is one dict entry, not a code change. The registry also drives automatic RBAC enforcement: `delete_resource` without the `admin` role fails Stage 1 in microseconds, no Decider call needed.
 
 ---
 
@@ -177,9 +200,15 @@ python agent_demo.py --comparison   # side-by-side: without vs. with IntentLock
 
 **The four questions are genuinely orthogonal.** A sophisticated attacker who crafts a call that passes `provenance_verdict` (arguments look operator-authorized) still has to pass `argument_value_alignment` (every value traces to verified lineage), `data_egress_policy` (destination is in scope), and `privilege_scope_check` (capabilities are bounded). Each dimension independently blocks a class of attacks.
 
+**Security review surfaces real bugs.** After the initial implementation a structured security review found three real vulnerabilities I'd missed. The most subtle: `_update_approved_value_pool` was adding values to the trusted pool on `Guide` and `Confirm` outcomes, not just `Proceed`. That meant an attacker could get a malicious argument into the trusted pool by triggering a Stage 1 `Guide` before the Decider ever saw it — *laundering* an untrusted value into session-derived status. One-line fix. The lesson: adversarial review of the trust-boundary logic is not optional on security-critical code.
+
+**The audit record is part of the security model.** Every `audit_log.append()` now also calls a pluggable `AbstractAuditSink` — `FileAuditSink` for local development, `CloudWatchAuditSink` for production — and every record carries a per-session HMAC of the provenance envelope. Without tamper evidence, an attacker who can write to the audit log can cover their tracks. The audit record is evidence, not telemetry.
+
 ---
 
 ## The reusable pattern
+
+**Minimal (development):**
 
 ```python
 from intentlock.policy_engine import (
@@ -201,7 +230,28 @@ handler = IntentLockPolicyHandler(
 agent = Agent(model=model, tools=my_tools, interventions=[handler])
 ```
 
-Five lines. The handler's `before_tool_call` method intercepts every proposed tool call. `export_audit(fmt="html")` gives you the security report. `export_audit(fmt="jsonl")` feeds your SIEM.
+**Production (with durable audit, HA Decider pool, distributed session state):**
+
+```python
+from intentlock.policy_engine import (
+    IntentLockPolicyHandler, LocalDeciderClient, DeciderPool,
+    ProvenanceContext, FileAuditSink, RedisSessionStore
+)
+
+pool = DeciderPool([
+    LocalDeciderClient(endpoint="http://decider-1:8099/v1/systemone"),
+    LocalDeciderClient(endpoint="http://decider-2:8099/v1/systemone"),
+])
+handler = IntentLockPolicyHandler(
+    client=pool,
+    context=ctx,
+    audit_sink=FileAuditSink("/var/log/intentlock/audit.jsonl"),
+    session_store=RedisSessionStore(host="redis", port=6379),
+    session_id=request_session_id,
+)
+```
+
+The handler's `before_tool_call` intercepts every proposed tool call. `export_audit(fmt="html")` gives the security analyst report. `export_audit(fmt="jsonl")` feeds a SIEM. Swap `FileAuditSink` for `CloudWatchAuditSink` to push records to CloudWatch Logs without changing any policy logic.
 
 ---
 
