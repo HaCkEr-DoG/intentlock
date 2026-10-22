@@ -61,7 +61,7 @@ except ImportError:
     BeforeToolCallEvent = Any  # type: ignore[misc,assignment]
 
 
-POLICY_VERSION = "2026.10.9"
+POLICY_VERSION = "2026.10.10"
 DEFAULT_CHECKPOINT = "StrandsAgents/strands-decider-2B-qwen3.5-v1-2610"
 
 # ---------------------------------------------------------------------------
@@ -631,6 +631,232 @@ class SessionRiskTracker:
 
 
 # ---------------------------------------------------------------------------
+# HTML audit report renderer
+# ---------------------------------------------------------------------------
+
+def _render_html_report(
+    audit_log: list[dict[str, Any]],
+    context: "ProvenanceContext",
+) -> str:
+    """
+    Render the audit log as a self-contained HTML security report.
+
+    Produces a professional dark-theme page that a security analyst or CISO
+    can open immediately to see: what was blocked, why, and the threat
+    trajectory across the session.  No external dependencies.
+    """
+    import datetime
+
+    ts_now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    # Outcome counts
+    counts: dict[str, int] = {"Proceed": 0, "Confirm": 0, "Guide": 0, "Deny": 0}
+    for rec in audit_log:
+        o = rec.get("outcome", "")
+        if o in counts:
+            counts[o] += 1
+
+    total = len(audit_log)
+    max_threat = max(
+        (rec.get("composite_threat_score") or 0.0 for rec in audit_log), default=0.0
+    )
+    session_threat_label = (
+        "CRITICAL" if max_threat >= 0.75
+        else "HIGH" if max_threat >= 0.50
+        else "MEDIUM" if max_threat >= 0.25
+        else "LOW"
+    )
+    threat_color = {
+        "CRITICAL": "#ef4444", "HIGH": "#f97316",
+        "MEDIUM": "#eab308", "LOW": "#22c55e",
+    }[session_threat_label]
+
+    def outcome_color(o: str) -> str:
+        return {"Proceed": "#22c55e", "Confirm": "#eab308",
+                "Guide": "#f97316", "Deny": "#ef4444"}.get(o, "#94a3b8")
+
+    def threat_bar(score: float | None) -> str:
+        if score is None:
+            return "<span style='color:#475569'>n/a</span>"
+        pct = int(score * 100)
+        color = (
+            "#ef4444" if score >= 0.75 else
+            "#f97316" if score >= 0.50 else
+            "#eab308" if score >= 0.25 else
+            "#22c55e"
+        )
+        return (
+            f"<div style='display:flex;align-items:center;gap:6px'>"
+            f"<div style='width:80px;height:8px;background:#1e293b;border-radius:4px'>"
+            f"<div style='width:{pct}px;max-width:80px;height:8px;background:{color};"
+            f"border-radius:4px'></div></div>"
+            f"<span style='color:{color};font-size:11px;font-family:monospace'>"
+            f"{score:.3f}</span></div>"
+        )
+
+    def badge(text: str, color: str) -> str:
+        return (
+            f"<span style='background:{color}22;color:{color};border:1px solid {color}44;"
+            f"border-radius:4px;padding:2px 7px;font-size:11px;font-family:monospace;"
+            f"white-space:nowrap'>{text}</span>"
+        )
+
+    # Build rows
+    rows_html: list[str] = []
+    for i, rec in enumerate(audit_log, 1):
+        o = rec.get("outcome", "?")
+        oc = outcome_color(o)
+        tool = rec.get("tool") or rec.get("tool_name") or "unknown"
+        ts_score = rec.get("composite_threat_score")
+        prov = rec.get("provenance_choice") or rec.get("prov_choice") or "—"
+        egress = rec.get("egress_choice") or "—"
+        arg_align = rec.get("arg_value_alignment") or "—"
+        reason = rec.get("reason") or ""
+        explanation = rec.get("explanation") or ""
+        remediation = rec.get("remediation") or ""
+        inj_hits = rec.get("injection_hits") or []
+        velocity = rec.get("velocity_anomaly", False)
+        latency = rec.get("latency_ms")
+        latency_str = f"{latency:.0f} ms" if latency is not None else "—"
+
+        detail_rows = ""
+        if inj_hits:
+            hits_text = "; ".join(str(h) for h in inj_hits[:3])
+            detail_rows += (
+                f"<tr><td style='color:#94a3b8;padding:2px 8px'>Stage-0 hits</td>"
+                f"<td style='color:#fca5a5;font-family:monospace;font-size:11px'>{hits_text}</td></tr>"
+            )
+        if explanation:
+            detail_rows += (
+                f"<tr><td style='color:#94a3b8;padding:2px 8px'>Explanation</td>"
+                f"<td style='color:#cbd5e1'>{explanation}</td></tr>"
+            )
+        if remediation and o in ("Deny", "Confirm"):
+            detail_rows += (
+                f"<tr><td style='color:#94a3b8;padding:2px 8px'>Remediation</td>"
+                f"<td style='color:#fbbf24'>{remediation}</td></tr>"
+            )
+        if velocity:
+            detail_rows += (
+                f"<tr><td style='color:#94a3b8;padding:2px 8px'>Velocity</td>"
+                f"<td style='color:#f97316'>anomaly detected</td></tr>"
+            )
+
+        detail_section = ""
+        if detail_rows:
+            detail_section = (
+                f"<details style='margin-top:6px'>"
+                f"<summary style='color:#64748b;cursor:pointer;font-size:11px'>details</summary>"
+                f"<table style='margin-top:4px;border-collapse:collapse'>{detail_rows}</table>"
+                f"</details>"
+            )
+
+        row_bg = "#1e293b" if i % 2 == 0 else "#0f172a"
+        rows_html.append(
+            f"<tr style='background:{row_bg}'>"
+            f"<td style='padding:8px 12px;color:#64748b;font-family:monospace'>{i}</td>"
+            f"<td style='padding:8px 12px;color:#e2e8f0;font-family:monospace'>{tool}</td>"
+            f"<td style='padding:8px 12px'>{badge(o, oc)}</td>"
+            f"<td style='padding:8px 12px'>{threat_bar(ts_score)}</td>"
+            f"<td style='padding:8px 12px;color:#94a3b8;font-size:12px;font-family:monospace'>{prov}</td>"
+            f"<td style='padding:8px 12px;color:#94a3b8;font-size:12px;font-family:monospace'>{egress}</td>"
+            f"<td style='padding:8px 12px;color:#94a3b8;font-size:12px'>{arg_align}</td>"
+            f"<td style='padding:8px 12px;color:#64748b;font-size:11px'>{latency_str}</td>"
+            f"<td style='padding:8px 12px;color:#94a3b8;font-size:12px'>"
+            f"{reason[:80] + '…' if len(reason) > 80 else reason}"
+            f"{detail_section}</td>"
+            f"</tr>"
+        )
+
+    rows_joined = "\n".join(rows_html)
+
+    def stat_card(label: str, value: str | int, color: str) -> str:
+        return (
+            f"<div style='background:#1e293b;border:1px solid #334155;"
+            f"border-radius:8px;padding:16px 20px;min-width:100px'>"
+            f"<div style='font-size:28px;font-weight:700;color:{color}'>{value}</div>"
+            f"<div style='font-size:12px;color:#64748b;margin-top:4px'>{label}</div>"
+            f"</div>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IntentLock Security Report</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #020617; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont,
+    'Segoe UI', sans-serif; font-size: 14px; line-height: 1.5; padding: 32px; }}
+  h1 {{ font-size: 22px; font-weight: 700; color: #f8fafc; }}
+  h2 {{ font-size: 14px; font-weight: 600; color: #94a3b8; text-transform: uppercase;
+    letter-spacing: 0.08em; margin: 28px 0 12px; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th {{ text-align: left; padding: 8px 12px; font-size: 11px; color: #475569;
+    text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid #1e293b; }}
+  tr:hover td {{ background: #1a2744 !important; }}
+  details > summary {{ list-style: none; }}
+  details > summary::-webkit-details-marker {{ display: none; }}
+</style>
+</head>
+<body>
+<div style="display:flex;align-items:center;justify-content:space-between;
+  border-bottom:1px solid #1e293b;padding-bottom:20px;margin-bottom:24px">
+  <div>
+    <h1>IntentLock Security Report</h1>
+    <div style="color:#475569;font-size:12px;margin-top:4px">
+      Operator: <span style="color:#94a3b8">{context.operator_id}</span>
+      &nbsp;·&nbsp; Policy version: <span style="color:#94a3b8">{POLICY_VERSION}</span>
+      &nbsp;·&nbsp; Generated: <span style="color:#94a3b8">{ts_now}</span>
+    </div>
+  </div>
+  <div style="text-align:right">
+    <div style="font-size:11px;color:#475569;margin-bottom:4px">SESSION THREAT LEVEL</div>
+    <div style="font-size:24px;font-weight:800;color:{threat_color}">{session_threat_label}</div>
+  </div>
+</div>
+
+<div style="display:flex;gap:12px;flex-wrap:wrap">
+  {stat_card("Total calls", total, "#94a3b8")}
+  {stat_card("Blocked (Deny)", counts["Deny"], "#ef4444")}
+  {stat_card("Confirm required", counts["Confirm"], "#eab308")}
+  {stat_card("Guided", counts["Guide"], "#f97316")}
+  {stat_card("Clean (Proceed)", counts["Proceed"], "#22c55e")}
+  {stat_card("Max threat score", f"{max_threat:.3f}", threat_color)}
+</div>
+
+<h2>Tool call timeline</h2>
+<div style="overflow-x:auto;border:1px solid #1e293b;border-radius:8px">
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Tool</th>
+      <th>Outcome</th>
+      <th>Threat score</th>
+      <th>Provenance</th>
+      <th>Egress</th>
+      <th>Arg alignment</th>
+      <th>Latency</th>
+      <th>Reason / Details</th>
+    </tr>
+  </thead>
+  <tbody>
+    {rows_joined}
+  </tbody>
+</table>
+</div>
+
+<div style="margin-top:32px;padding-top:20px;border-top:1px solid #1e293b;
+  color:#334155;font-size:11px">
+  IntentLock {POLICY_VERSION} · Strands Decider 2B · AWS Strands Agents Hackathon
+</div>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
 # Policy handler
 # ---------------------------------------------------------------------------
 
@@ -1000,7 +1226,10 @@ class IntentLockPolicyHandler(InterventionHandler):
                 writer.writerow(flat)
             return buf.getvalue()
 
-        raise ValueError(f"Unsupported export format {fmt!r}; use 'jsonl' or 'csv'.")
+        if fmt == "html":
+            return _render_html_report(self.audit_log, self.context)
+
+        raise ValueError(f"Unsupported export format {fmt!r}; use 'jsonl', 'csv', or 'html'.")
 
     def _scan_untrusted_for_injection(self) -> list[str]:
         """

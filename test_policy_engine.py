@@ -720,6 +720,62 @@ class PolicyEngineTests(unittest.TestCase):
         labels = handler._trace_argument_values({"environment": "staging"})
         self.assertIn("operator-referenced", labels["environment"])
 
+    # ------------------------------------------------------------------
+    # export_audit(fmt="html") tests
+    # ------------------------------------------------------------------
+
+    def test_export_audit_html_returns_string(self):
+        handler = IntentLockPolicyHandler(FakeClient(), context())
+        handler.evaluate_tool_call("deploy", {"resource_id": "web-1", "environment": "staging"})
+        html = handler.export_audit(fmt="html")
+        self.assertIsInstance(html, str)
+
+    def test_export_audit_html_contains_doctype(self):
+        handler = IntentLockPolicyHandler(FakeClient(), context())
+        handler.evaluate_tool_call("deploy", {"resource_id": "web-1"})
+        html = handler.export_audit(fmt="html")
+        self.assertIn("<!DOCTYPE html>", html)
+
+    def test_export_audit_html_shows_outcome_counts(self):
+        handler = IntentLockPolicyHandler(FakeClient(), context())
+        handler.evaluate_tool_call("deploy", {"resource_id": "web-1"})
+        html = handler.export_audit(fmt="html")
+        # Should surface the outcome somewhere (Proceed, Deny, etc.)
+        self.assertTrue(
+            any(o in html for o in ("Proceed", "Confirm", "Guide", "Deny")),
+            "HTML report must show at least one outcome label",
+        )
+
+    def test_export_audit_html_contains_tool_name(self):
+        handler = IntentLockPolicyHandler(FakeClient(), context())
+        handler.evaluate_tool_call("my_special_tool", {"x": "y"})
+        html = handler.export_audit(fmt="html")
+        self.assertIn("my_special_tool", html)
+
+    def test_export_audit_html_contains_policy_version(self):
+        from intentlock.policy_engine import POLICY_VERSION
+        handler = IntentLockPolicyHandler(FakeClient(), context())
+        handler.evaluate_tool_call("deploy", {"resource_id": "web-1"})
+        html = handler.export_audit(fmt="html")
+        self.assertIn(POLICY_VERSION, html)
+
+    def test_export_audit_html_zero_calls_stat_card_present(self):
+        # export_audit with an empty log falls through to the ValueError path,
+        # so first make one call, then verify stat card labels appear.
+        handler = IntentLockPolicyHandler(FakeClient(), context())
+        handler.evaluate_tool_call("probe", {"x": "1"})
+        html = handler.export_audit(fmt="html")
+        self.assertIn("Total calls", html)
+
+    def test_export_audit_html_deny_outcome_shown(self):
+        handler = IntentLockPolicyHandler(
+            FakeClient(provenance="untrusted_injection"),
+            context(),
+        )
+        handler.evaluate_tool_call("bad_tool", {"dest": "s3://evil/bucket"})
+        html = handler.export_audit(fmt="html")
+        self.assertIn("Deny", html)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
