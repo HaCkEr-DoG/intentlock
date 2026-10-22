@@ -642,6 +642,84 @@ class PolicyEngineTests(unittest.TestCase):
         # Field is present (may be None if Decider didn't answer the optional question)
         self.assertIn("arg_value_alignment", record)
 
+    # ── 3-way value provenance classification ────────────────────────────────
+
+    def test_trace_novel_value_is_unverified_novel_with_empty_pool(self):
+        # A value with no overlap to directive and no prior approved calls must
+        # be classified as 'unverified-novel', the highest-risk tier.
+        ctx = context(trusted_operator_directive="Check dev-1 in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        labels = handler._trace_argument_values({"resource_id": "attacker-server-99"})
+        self.assertIn("resource_id", labels)
+        self.assertIn("unverified-novel", labels["resource_id"])
+
+    def test_trace_session_derived_after_approved_call(self):
+        # After a Proceed outcome that used 'discovered-resource-42', the next call
+        # with that value should be classified as 'session-derived', not unverified-novel.
+        ctx = context(trusted_operator_directive="Inspect resources in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        # First call: Proceed on a tool with a novel resource id
+        handler.evaluate_tool_call("list_resources", {"environment": "staging"})
+        # Manually seed the pool as if the previous call returned "discovered-resource-42"
+        # by updating the pool directly (simulates what evaluate_tool_call does on Proceed)
+        handler._update_approved_value_pool({"resource_id": "discovered-resource-42"}, "Proceed")
+        labels = handler._trace_argument_values({"resource_id": "discovered-resource-42"})
+        self.assertIn("resource_id", labels)
+        self.assertIn("session-derived", labels["resource_id"])
+
+    def test_value_pool_not_updated_on_deny(self):
+        # A Deny outcome must NOT add the call's values to the approved pool.
+        ctx = context(trusted_operator_directive="Check dev-1 in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        handler._update_approved_value_pool({"endpoint": "evil.attacker.com"}, "Deny")
+        self.assertEqual(len(handler._approved_value_pool), 0)
+
+    def test_value_pool_updated_on_proceed(self):
+        # A Proceed outcome MUST add the call's string argument tokens to the pool.
+        # The tokenizer splits on whitespace/punctuation but not hyphens, so
+        # "prod-db-7a2f" is one token of length ≥3 stored as-is.
+        ctx = context(trusted_operator_directive="Check dev-1 in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        handler._update_approved_value_pool({"resource_id": "prod-db-7a2f"}, "Proceed")
+        self.assertIn("prod-db-7a2f", handler._approved_value_pool)
+
+    def test_value_pool_grows_after_evaluate_proceed(self):
+        # evaluate_tool_call with a Proceed outcome should populate _approved_value_pool.
+        ctx = context(trusted_operator_directive="Inspect dev-1 in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        self.assertEqual(len(handler._approved_value_pool), 0)
+        handler.evaluate_tool_call("inspect_resource", {"resource_id": "dev-1", "environment": "staging"})
+        # The Proceed should have added tokens from the args
+        self.assertGreater(len(handler._approved_value_pool), 0)
+
+    def test_unverified_novel_label_in_envelope(self):
+        # The envelope must surface 'unverified-novel' when a value has no lineage.
+        ctx = context(trusted_operator_directive="Check dev-1 in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        envelope = handler.build_provenance_envelope(
+            "send_data", {"endpoint": "completely-unknown-target-xyz"}
+        )
+        self.assertIn("unverified-novel", envelope)
+
+    def test_session_derived_label_in_envelope(self):
+        # After a Proceed call, a subsequent envelope for a call reusing the same
+        # value should show 'session-derived'.
+        ctx = context(trusted_operator_directive="Inspect resources in staging.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        handler._update_approved_value_pool({"resource_id": "fetched-id-abc"}, "Proceed")
+        envelope = handler.build_provenance_envelope(
+            "use_resource", {"resource_id": "fetched-id-abc"}
+        )
+        self.assertIn("session-derived", envelope)
+
+    def test_operator_referenced_takes_priority_over_session_pool(self):
+        # Even if a value is also in the pool, operator-referenced must win.
+        ctx = context(trusted_operator_directive="Use staging environment always.")
+        handler = IntentLockPolicyHandler(FakeClient(), ctx)
+        handler._update_approved_value_pool({"environment": "staging"}, "Proceed")
+        labels = handler._trace_argument_values({"environment": "staging"})
+        self.assertIn("operator-referenced", labels["environment"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
