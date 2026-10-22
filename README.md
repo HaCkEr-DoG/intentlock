@@ -2,9 +2,30 @@
 
 **IntentLock** is a provenance-aware temporal policy engine for agentic cloud InfraOps.
 
-It uses [Strands Decider 2B](https://strandsagents.com/blog/introducing-strands-decider-2b/) to evaluate three orthogonal policy questions before any infrastructure tool call executes, paired with Amazon Bedrock for the generative agent layer.
+It uses [Strands Decider 2B](https://strandsagents.com/blog/introducing-strands-decider-2b/) to evaluate four orthogonal policy questions before any infrastructure tool call executes, paired with Amazon Bedrock for the generative agent layer.
 
 **Hackathon tags:** `#strands-decider-2b` `#policy`
+
+---
+
+## What makes this different
+
+Most agent security tools operate at the text generation layer or apply keyword filters.
+IntentLock operates at the **tool-call execution layer** — the moment an agent proposes a
+real-world action — using a principled combination:
+
+| Layer | What it catches | Latency |
+|---|---|---|
+| Stage 0 — regex injection scan | Known injection phrases in untrusted data | < 0.01 ms |
+| Stage 1 — deterministic rules | RBAC, ownership, denylist, digest binding | < 0.1 ms |
+| Stage 2 — Strands Decider 2B | Semantic judgment: 4 orthogonal policy questions | ~1890 ms warm |
+| Session risk tracker | Velocity anomalies, score accumulation, lockout | 0 ms (in-process) |
+
+**Unique to IntentLock:**
+- **3-tier value provenance** — distinguishes `operator-referenced` / `session-derived` / `unverified-novel` values before the Decider sees the call; gives the model fine-grained lineage signal rather than a binary "novel or not"
+- **Soft-signal detection** — reads the raw probability distribution, not just the argmax; a model that is 30% confident in injection fires a soft signal even when the top label is clean
+- **Session trajectory context** — every Decider call includes the last 5 tool outcomes so the model can detect read-then-exfil and other multi-step patterns
+- **Fail-closed circuit breaker** — Decider unavailability never silently allows a call
 
 ---
 
@@ -50,27 +71,34 @@ Operator directive
 │                           ▼                                      │
 │  STAGE 2 — Strands Decider 2B             (~1890 ms MPS warm)   │
 │  ├── Build enriched provenance envelope                          │
-│  │   (policy + directive + authorized scope + untrusted data)   │
-│  └── Three batched choice questions (/v1/systemone):            │
+│  │   (proposed call + 3-tier arg tracing + directive + history) │
+│  └── Four batched questions (/v1/systemone, one round-trip):    │
 │       ┌──────────────────────────────────────────────────────┐  │
 │       │  provenance_verdict:  trusted_operator               │  │
-│       │                       ungrounded_guess               │  │
+│       │    CALL SOURCE        ungrounded_guess               │  │
 │       │                       untrusted_injection            │  │
 │       │                                                       │  │
 │       │  data_egress_policy:  internal_scoped                │  │
-│       │                       ambiguous_scope                │  │
+│       │    CALL DESTINATION   ambiguous_scope                │  │
 │       │                       unauthorized_egress            │  │
 │       │                                                       │  │
 │       │  privilege_scope_check: within_authorized_scope      │  │
-│       │                         scope_expansion              │  │
+│       │    CAPABILITIES         scope_expansion              │  │
 │       │                         privilege_escalation         │  │
+│       │                                                       │  │
+│       │  argument_value_alignment: yes                       │  │
+│       │    VALUE LINEAGE           no (unverified-novel arg) │  │
 │       └──────────────────────────────────────────────────────┘  │
 │                           │                                      │
-│  STAGE 3 — Most-restrictive-wins mapping                        │
+│  STAGE 3 — Most-restrictive-wins mapping + risk accumulation    │
 │  ├── Any escalation/injection/egress → Deny                     │
+│  ├── Unverified-novel arg value → Guide / Deny                  │
+│  ├── Soft injection signal (p > 0.30) + Stage-0 hit → Deny     │
 │  ├── Ungrounded → Guide (bounded retries)                       │
 │  ├── Ambiguous / low confidence → Confirm                       │
-│  └── All three benign + all conf ≥ 0.70 → Proceed              │
+│  ├── All four benign + all conf ≥ 0.70 → Proceed               │
+│  └── SessionRiskTracker: accumulates score; velocity anomaly;   │
+│      adaptive threshold; session lockout at sustained risk      │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ Proceed / Confirm / Guide / Deny
                            ▼
@@ -88,17 +116,52 @@ Operator directive
 
 ## Decision pattern: Policy
 
-Three orthogonal `choice` questions asked in a single `/v1/systemone` request:
+Four orthogonal questions asked in a single `/v1/systemone` request.
+Each covers an independent attack dimension — one adversarial answer is enough to escalate,
+regardless of the other three.
 
-| Question ID | Options |
+| Question ID | Dimension | Options |
+|---|---|---|
+| `provenance_verdict` | Call source | `trusted_operator` · `ungrounded_guess` · `untrusted_injection` |
+| `data_egress_policy` | Call destination | `internal_scoped` · `ambiguous_scope` · `unauthorized_egress` |
+| `privilege_scope_check` | Capabilities | `within_authorized_scope` · `scope_expansion` · `privilege_escalation` |
+| `argument_value_alignment` | Value lineage | `yes` (all traceable) · `no` (unverified-novel value present) |
+
+**Most-restrictive-wins mapping:**
+
+| Condition | Action |
 |---|---|
-| `provenance_verdict` | `trusted_operator` · `ungrounded_guess` · `untrusted_injection` |
-| `data_egress_policy` | `internal_scoped` · `ambiguous_scope` · `unauthorized_egress` |
-| `privilege_scope_check` | `within_authorized_scope` · `scope_expansion` · `privilege_escalation` |
+| `untrusted_injection` OR `unauthorized_egress` OR `privilege_escalation` | **Deny** |
+| `argument_value_alignment = no` with low confidence | **Guide / Deny** |
+| `scope_expansion` | **Confirm** |
+| `ungrounded_guess` OR `ambiguous_scope` | **Confirm** |
+| All four clear + all confidence ≥ 0.70 | **Proceed** |
 
-Any answer in the "danger" column of any question triggers the most-restrictive outcome.
-This means a single low-confidence injection signal is enough to block — the engine
-never needs all three to agree before denying.
+### Three-tier value provenance
+
+Before calling the Decider, IntentLock classifies every string argument value:
+
+| Tier | Meaning | Risk |
+|---|---|---|
+| `operator-referenced` | ≥50% token overlap with the trusted directive | Lowest |
+| `session-derived` | Novel vs. directive but seen in a prior **approved** call this session | Medium |
+| `unverified-novel` | No lineage in directive OR approved session history | **Highest — prime injection target** |
+
+A resource ID discovered through an approved `list_resources` call becomes `session-derived` on
+the next call — safe.  A URL that appeared only in an external email is `unverified-novel` — flagged.
+
+### Soft-signal detection
+
+IntentLock reads the raw probability distribution from Decider, not just the winning label.
+If `p(untrusted_injection) > 0.30` even when the top label is `trusted_operator`, that is a
+soft signal.  Two soft signals, or one soft signal combined with a Stage 0 injection hit,
+escalates to Deny.
+
+### Session trajectory context
+
+Every Decider envelope includes a compact log of the last 5 tool calls (tool name, outcome,
+provenance verdict, egress verdict).  This lets the Decider detect multi-step attack patterns —
+read-then-exfil, incremental scope creep, APT-style decomposed attacks — that look innocent call-by-call.
 
 ### Reusable wiring
 
@@ -270,7 +333,30 @@ class DynamoDBLedger(AbstractDryRunLedger):
 ```
 
 2. **Decider server on a sidecar or dedicated instance** — ECS sidecar or EC2 with MPS/GPU
-3. **CloudWatch metrics** — emit `IntentLock/PolicyDecision` with dimensions: outcome, stage, tool
+
+3. **CloudWatch metrics** — emit per-decision telemetry for real-time observability:
+
+```python
+import boto3
+cw = boto3.client("cloudwatch", region_name="us-east-1")
+
+def emit_policy_decision(record: dict) -> None:
+    cw.put_metric_data(
+        Namespace="IntentLock/PolicyDecisions",
+        MetricData=[
+            {"MetricName": "Decision", "Value": 1,
+             "Dimensions": [{"Name": "Outcome",  "Value": record["outcome"]},
+                            {"Name": "Stage",    "Value": record.get("stage", "stage2")},
+                            {"Name": "ThreatTier",
+                             "Value": "high" if record["composite_threat_score"] > 0.6 else "low"}]},
+            {"MetricName": "ThreatScore", "Value": record["composite_threat_score"],
+             "Dimensions": [{"Name": "Tool", "Value": record["tool_name"]}]},
+        ],
+    )
+```
+
+Set a CloudWatch alarm on `Outcome=Deny` rate or `ThreatScore` p95 for early breach detection.
+
 4. **Fail-closed by default** — already the default; set `fail_open=True` only for non-critical paths
 
 ---
@@ -281,14 +367,15 @@ class DynamoDBLedger(AbstractDryRunLedger):
 intentlock/
   __init__.py
   policy_engine.py                  # policy engine, Decider client, ledger interface
-test_policy_engine.py               # offline unit tests (no Decider server)
+patterns/
+  intentlock_policy_pattern.py      # standalone drop-in pattern with injection demo
+test_policy_engine.py               # 73 offline unit tests (no Decider server)
 run_eval_harness.py                 # seven-scenario regression harness
 agent_demo.py                       # Bedrock agent with simulated InfraOps tools
 requirements.txt
 pyproject.toml
 README.md
-INTENTLOCK_POLICY_PATCH_README.md   # patch notes and limitations
-intentlock_mock_eval_results.json   # mock interface run; not real-model metrics
+ARTICLE_DRAFT.md                    # Builder Center article draft
 ```
 
 ---
