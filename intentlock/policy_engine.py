@@ -984,11 +984,16 @@ class IntentLockPolicyHandler(InterventionHandler):
         # Compact log of prior tool calls included in each envelope so Decider
         # can reason about trajectory, not just the current call in isolation.
         self._session_ops: list[dict[str, Any]] = []
-        # Tokenised string values from all prior approved (Proceed/Guide/Confirm)
-        # tool calls.  Used to distinguish 'session-derived' from 'unverified-novel'
-        # in _trace_argument_values: a novel-vs-directive value that appears here was
-        # already policy-checked, so it carries medium trust rather than lowest.
+        # Tokenised string values from all prior Proceed-approved tool calls.
+        # Used to distinguish 'session-derived' from 'unverified-novel'
+        # in _trace_argument_values.  Only Proceed outcomes populate this pool:
+        # Guide/Confirm calls have not cleared Stage 2, so adding their argument
+        # tokens here would launder injected values into medium-trust status.
         self._approved_value_pool: set[str] = set()
+        # Set of (source_str, pattern_index) pairs already counted this session
+        # by Stage 0.  Prevents a static benign log entry from adding +0.12 risk
+        # on every subsequent tool call.
+        self._injection_seen: set[tuple[str, int]] = set()
 
     def before_invocation(self, event: BeforeInvocationEvent, **kwargs: Any):
         self._retry_counts.clear()
@@ -1062,13 +1067,13 @@ class IntentLockPolicyHandler(InterventionHandler):
         self, tool_args: dict[str, Any], outcome: str
     ) -> None:
         """
-        After an approved outcome (Proceed, Guide, Confirm), add the call's
-        string argument tokens to _approved_value_pool so subsequent calls can
-        identify session-derived values and distinguish them from unverified-novel
-        ones.  Deny outcomes are intentionally excluded: a blocked call's values
-        should not gain approved-pool status.
+        Only on Proceed: add the call's string argument tokens to
+        _approved_value_pool so subsequent calls can identify session-derived
+        values.  Guide and Confirm are excluded because their args have not
+        cleared Stage 2 — admitting them would allow injected values to launder
+        into medium-trust session-derived status on the very next call.
         """
-        if outcome not in ("Proceed", "Guide", "Confirm"):
+        if outcome != "Proceed":
             return
         for val in tool_args.values():
             if isinstance(val, str) and val.strip():
@@ -1088,9 +1093,14 @@ class IntentLockPolicyHandler(InterventionHandler):
         if self.context.untrusted_external_data:
             # Truncate each untrusted entry to 2 000 chars to avoid pushing
             # the state past Decider's effective context window.
+            # Strip bracket-delimited section headers from untrusted content so
+            # adversarial logs cannot spoof envelope sections like [WRITTEN POLICY].
+            _header_re = re.compile(r"^\s*\[[A-Z][A-Z _]{2,}\]\s*$", re.MULTILINE)
             untrusted_lines = []
             for item in self.context.untrusted_external_data:
                 content = item.get("content", "")
+                # Replace any section-header-shaped lines with a sanitized marker
+                content = _header_re.sub("[sanitized-header]", content)
                 if len(content) > 2000:
                     content = content[:2000] + "\n[… truncated for policy evaluation …]"
                 untrusted_lines.append(
@@ -1325,11 +1335,20 @@ class IntentLockPolicyHandler(InterventionHandler):
         """
         hits: list[str] = []
         for item in self.context.untrusted_external_data:
+            source = item.get("source", "unknown")
             text = item.get("content", "")
-            for pattern in _INJECTION_PATTERNS:
+            for idx, pattern in enumerate(_INJECTION_PATTERNS):
+                key = (source, idx)
+                if key in self._injection_seen:
+                    # Already counted this session — don't add repeated risk
+                    # for the same static external data entry.
+                    continue
                 m = pattern.search(text)
                 if m:
-                    hits.append(f"{pattern.pattern!r} matched in source={item.get('source', 'unknown')!r}: {m.group(0)!r}")
+                    self._injection_seen.add(key)
+                    hits.append(
+                        f"{pattern.pattern!r} matched in source={source!r}: {m.group(0)!r}"
+                    )
         return hits
 
     def _remediation_hint(
